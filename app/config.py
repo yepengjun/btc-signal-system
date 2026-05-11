@@ -5,7 +5,7 @@ load_dotenv()
 
 class Settings:
     binance_symbol: str = os.getenv("BINANCE_SYMBOL", "BTC/USDT:USDT")
-    db_path: str = os.getenv("DB_PATH", "/app/data/signals.db")
+    db_path: str = os.getenv("DB_PATH", "./data/signals.db")
     session_secret: str = os.getenv("SESSION_SECRET", "change-me-in-production")
     username: str = os.getenv("APP_USERNAME", "wang")
     password: str = os.getenv("APP_PASSWORD", "trad2026")

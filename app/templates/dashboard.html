@@ -1,0 +1,1836 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BTC 合约交易信号 - 自进化系统</title>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, 'SF Pro', 'Helvetica Neue', sans-serif;
+  background: #0a0e17;
+  color: #e1e5ee;
+  min-height: 100vh;
+}
+
+/* ─── Header ─── */
+.header {
+  padding: 20px 30px;
+  display: flex; align-items: center; justify-content: space-between;
+  border-bottom: 1px solid #1a2035;
+}
+.header h1 { font-size: 22px; font-weight: 600; color: #fff; }
+.header h1 span { color: #f7931a; }
+.header-right { display: flex; align-items: center; gap: 16px; }
+.user-bar { display: flex; align-items: center; gap: 10px; }
+.live-badge { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #6b7280; }
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+.tab-btn {
+  padding: 6px 16px; border-radius: 6px; border: 1px solid #374151;
+  background: transparent; color: #9ca3af; cursor: pointer; font-size: 13px; transition: all 0.2s;
+}
+.tab-btn:hover { border-color: #6b7280; color: #e5e7eb; }
+.tab-btn.active { background: #1f2937; border-color: #f7931a; color: #f7931a; }
+.logout-btn {
+  padding: 6px 14px; border-radius: 6px; border: 1px solid #374151;
+  background: transparent; color: #cbd5e1; cursor: pointer; font-size: 13px; transition: all 0.2s;
+}
+.logout-btn:hover { border-color: #ef4444; color: #ef4444; }
+
+/* ─── Ticker ─── */
+.ticker-bar {
+  display: flex; gap: 30px; padding: 15px 30px;
+  background: #0d1220; border-bottom: 1px solid #1a2035; flex-wrap: wrap;
+}
+.ticker-item { display: flex; flex-direction: column; gap: 2px; }
+.ticker-label { font-size: 11px; color: #6b7280; text-transform: uppercase; }
+.ticker-value { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ticker-value.price { color: #fff; font-size: 24px; }
+
+.main { padding: 20px 30px; }
+
+/* ─── Overall Signal ─── */
+.overall-signal {
+  background: #111827; border-radius: 12px; border: 1px solid #1f2937;
+  padding: 20px; margin-bottom: 20px;
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px;
+}
+.overall-label { font-size: 14px; color: #9ca3af; }
+.overall-value { font-size: 28px; font-weight: 700; }
+
+/* ─── Signal Cards ─── */
+/* Verdict panel */
+.verdict-panel {
+  text-align: center; padding: 30px 20px; margin-bottom: 16px;
+  border-radius: 12px; border: 1px solid #1f2937; background: #111827;
+}
+.verdict-panel.verdict-bullish { border-color: #22c55e40; background: linear-gradient(180deg, #0a1a0e, #111827); }
+.verdict-panel.verdict-bearish { border-color: #ef444440; background: linear-gradient(180deg, #1a0a0a, #111827); }
+.verdict-panel.verdict-neutral { border-color: #eab30840; background: linear-gradient(180deg, #1a1a0a, #111827); }
+.verdict-regime { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
+.verdict-bullish .verdict-regime { color: #22c55e; }
+.verdict-bearish .verdict-regime { color: #ef4444; }
+.verdict-neutral .verdict-regime { color: #eab308; }
+.verdict-summary { font-size: 15px; color: #9ca3af; margin-bottom: 6px; }
+.verdict-confidence { font-size: 13px; color: #6b7280; }
+
+.verdict-details {
+  background: #111827; border-radius: 8px; border: 1px solid #1f2937;
+  padding: 12px 16px; margin-bottom: 16px;
+}
+.detail-item { font-size: 13px; color: #9ca3af; padding: 4px 0; }
+
+.tf-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: 12px; margin-bottom: 20px;
+}
+.tf-card {
+  background: #111827; border-radius: 10px; border: 1px solid #1f2937;
+  padding: 16px; text-align: center;
+}
+.tf-label { font-size: 13px; color: #6b7280; margin-bottom: 8px; }
+.tf-adx { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+.tf-di { font-size: 12px; color: #9ca3af; margin-bottom: 6px; }
+.tf-regime { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+.tf-duration { font-size: 12px; color: #6b7280; }
+.tf-vol { font-size: 11px; color: #6b7280; }
+.tf-squeeze { font-size: 11px; color: #eab308; font-weight: 600; margin-top: 4px; }
+.tf-divergence { font-size: 11px; color: #ef4444; font-weight: 600; margin-top: 4px; }
+
+.history-panel { margin: 16px 0; padding: 14px; background: #111827; border-radius: 10px; border: 1px solid rgba(255,255,255,0.06); }
+.history-title { font-size: 14px; font-weight: 600; color: #9ca3af; margin-bottom: 10px; }
+.history-list { display: flex; flex-direction: column; gap: 6px; }
+.history-item { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 6px 8px; border-radius: 6px; background: rgba(255,255,255,0.02); flex-wrap: wrap; }
+.history-item.h-bull { border-left: 3px solid #22c55e; }
+.history-item.h-bear { border-left: 3px solid #ef4444; }
+.h-time { color: #6b7280; min-width: 80px; font-family: monospace; }
+.h-price { color: #e5e7eb; min-width: 65px; font-family: monospace; font-weight: 600; }
+.h-regime { min-width: 70px; }
+.h-regime.up { color: #22c55e; }
+.h-regime.down { color: #ef4444; }
+.h-regime.warn { color: #eab308; }
+.h-strength { color: #9ca3af; font-size: 11px; }
+.h-adx { color: #6b7280; font-size: 11px; font-family: monospace; }
+.h-advice { font-weight: 600; color: #9ca3af; margin-left: auto; }
+.h-advice.act { color: #22c55e; }
+.h-advice.exit { color: #ef4444; }
+
+/* ─── 30m Snapshots ─── */
+.snapshot-panel {
+  background: #111827; border-radius: 12px; border: 1px solid #1f2937;
+  padding: 16px; margin-bottom: 20px;
+}
+.snapshot-title { font-size: 14px; font-weight: 600; color: #e5e7eb; margin-bottom: 10px; }
+.snapshot-list { max-height: 240px; overflow-y: auto; }
+.snapshot-item {
+  display: flex; align-items: center; gap: 12px; padding: 5px 8px;
+  font-size: 12px; border-radius: 4px; font-variant-numeric: tabular-nums;
+}
+.snapshot-item:nth-child(odd) { background: rgba(13,18,32,0.5); }
+.snap-time { color: #6b7280; width: 65px; flex-shrink: 0; }
+.snap-price { color: #e5e7eb; width: 80px; flex-shrink: 0; font-weight: 600; }
+.snap-adx { color: #9ca3af; width: 55px; flex-shrink: 0; }
+.snap-di { width: 70px; flex-shrink: 0; }
+.snap-regime { font-weight: 600; }
+.snap-regime.up { color: #22c55e; }
+.snap-regime.down { color: #ef4444; }
+.snap-regime.warn { color: #eab308; }
+
+.signal-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 20px; margin-bottom: 20px;
+}
+.signal-card {
+  background: #111827; border-radius: 12px; border: 1px solid #1f2937;
+  overflow: hidden; transition: border-color 0.3s;
+}
+.signal-card:hover { border-color: #374151; }
+.card-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 20px; border-bottom: 1px solid #1f2937;
+}
+.card-title { font-size: 15px; font-weight: 600; }
+.card-badge { padding: 4px 14px; border-radius: 20px; font-size: 13px; font-weight: 600; }
+.badge-bullish { background: rgba(34,197,94,0.15); color: #22c55e; }
+.badge-bearish { background: rgba(239,68,68,0.15); color: #ef4444; }
+.badge-neutral { background: rgba(234,179,8,0.15); color: #eab308; }
+
+.confidence-bar { height: 4px; background: #1f2937; }
+.confidence-fill { height: 100%; transition: width 0.8s ease; }
+.fill-bullish { background: linear-gradient(90deg, #166534, #22c55e); }
+.fill-bearish { background: linear-gradient(90deg, #991b1b, #ef4444); }
+.fill-neutral { background: linear-gradient(90deg, #854d0e, #eab308); }
+
+.card-body { padding: 16px 20px; }
+.card-times {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.time-box {
+  background: #0d1220;
+  border: 1px solid #1a2035;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.time-box-label {
+  font-size: 11px;
+  color: #6b7280;
+  margin-bottom: 4px;
+}
+.time-box-value {
+  font-size: 13px;
+  color: #e5e7eb;
+  font-variant-numeric: tabular-nums;
+}
+.indicators-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; margin-bottom: 14px; }
+.indicator { background: #0d1220; padding: 10px; border-radius: 8px; text-align: center; }
+.indicator-label { font-size: 11px; color: #6b7280; margin-bottom: 3px; }
+.indicator-value { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.reasons-list { list-style: none; }
+.reason-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 0; border-bottom: 1px solid #1a2035; font-size: 13px;
+}
+.reason-item:last-child { border-bottom: none; }
+.reason-dot { width: 6px; height: 6px; border-radius: 50%; margin-right: 8px; flex-shrink: 0; }
+.dot-bullish { background: #22c55e; }
+.dot-bearish { background: #ef4444; }
+.dot-neutral { background: #eab308; }
+.reason-name { flex: 1; }
+.reason-value { color: #6b7280; font-variant-numeric: tabular-nums; }
+.reason-weight { color: #4b5563; font-size: 11px; margin-left: 8px; min-width: 36px; text-align: right; }
+
+/* ─── Evolution Panel ─── */
+.evo-section {
+  background: #111827; border-radius: 12px; border: 1px solid #1f2937;
+  padding: 20px; margin-bottom: 20px;
+}
+.evo-section h3 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #e5e7eb; }
+
+.evo-overview {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px; margin-bottom: 20px;
+}
+.evo-stat {
+  background: #0d1220; padding: 14px; border-radius: 8px; text-align: center;
+}
+.evo-stat-label { font-size: 11px; color: #6b7280; margin-bottom: 4px; }
+.evo-stat-value { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.evo-tf-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 16px; margin-bottom: 20px;
+}
+.evo-tf-card {
+  background: #0d1220; border-radius: 10px; padding: 16px;
+  border: 1px solid #1a2035;
+}
+.evo-tf-title {
+  font-size: 14px; font-weight: 600; margin-bottom: 12px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.evo-accuracy {
+  padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600;
+}
+.acc-good { background: rgba(34,197,94,0.15); color: #22c55e; }
+.acc-ok { background: rgba(234,179,8,0.15); color: #eab308; }
+.acc-bad { background: rgba(239,68,68,0.15); color: #ef4444; }
+.acc-none { background: rgba(107,114,128,0.15); color: #6b7280; }
+
+/* Weight bars */
+.weight-list { margin-bottom: 12px; }
+.weight-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 0; font-size: 13px;
+}
+.weight-name { width: 60px; color: #9ca3af; text-transform: uppercase; font-size: 11px; }
+.weight-bar-bg { flex: 1; height: 6px; background: #1f2937; border-radius: 3px; overflow: hidden; position: relative; }
+.weight-bar-fill { height: 100%; border-radius: 3px; transition: width 0.6s ease; }
+.weight-val { width: 40px; text-align: right; font-size: 12px; color: #9ca3af; font-variant-numeric: tabular-nums; }
+.weight-acc { width: 50px; text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* Recent predictions */
+.recent-table { width: 100%; font-size: 12px; border-collapse: collapse; }
+.recent-table th {
+  text-align: left; color: #6b7280; font-weight: 500; padding: 6px 8px;
+  border-bottom: 1px solid #1f2937; font-size: 11px;
+}
+.recent-table td { padding: 6px 8px; border-bottom: 1px solid #111827; }
+.result-correct { color: #22c55e; }
+.result-wrong { color: #ef4444; }
+.result-pending { color: #6b7280; }
+
+/* Evolution log */
+.evo-log { margin-top: 16px; }
+.evo-log-item {
+  background: #0d1220; border-radius: 8px; padding: 12px; margin-bottom: 8px;
+  border-left: 3px solid #f7931a; font-size: 12px;
+}
+.evo-log-header { display: flex; justify-content: space-between; margin-bottom: 6px; }
+.evo-log-tf { color: #f7931a; font-weight: 600; }
+.evo-log-time { color: #6b7280; }
+.evo-log-changes { color: #9ca3af; line-height: 1.6; }
+
+/* ─── Advice Panel ─── */
+.advice-panel {
+  border-radius: 12px; padding: 16px 20px; margin-bottom: 16px;
+  border: 1px solid #1f2937; background: #111827;
+}
+.advice-trade { border-color: rgba(34,197,94,0.4); background: linear-gradient(135deg, rgba(34,197,94,0.06), #111827); }
+.advice-exit { border-color: rgba(239,68,68,0.4); background: linear-gradient(135deg, rgba(239,68,68,0.06), #111827); }
+.advice-wait { border-color: rgba(107,114,128,0.3); }
+.advice-action { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+.advice-trade .advice-action { color: #22c55e; }
+.advice-exit .advice-action { color: #ef4444; }
+.advice-wait .advice-action { color: #9ca3af; }
+.advice-reason { font-size: 13px; color: #9ca3af; margin-bottom: 10px; }
+.advice-targets { display: flex; gap: 12px; }
+.advice-tag {
+  padding: 6px 14px; border-radius: 8px; font-size: 13px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.advice-tag.target { background: rgba(34,197,94,0.1); color: #22c55e; }
+.advice-tag.stop { background: rgba(239,68,68,0.1); color: #ef4444; }
+.advice-positions { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 12px; }
+.advice-pos { display: flex; align-items: baseline; gap: 8px; font-size: 13px; flex-wrap: wrap; }
+.pos-label { font-weight: 700; min-width: 36px; flex-shrink: 0; }
+.advice-pos.long .pos-label { color: #22c55e; }
+.advice-pos.short .pos-label { color: #ef4444; }
+.pos-action { font-weight: 600; color: #e5e7eb; min-width: 72px; flex-shrink: 0; }
+.pos-reason { color: #9ca3af; }
+.pos-target { color: #facc15; font-size: 12px; margin-left: 4px; }
+.pos-stop { color: #f87171; font-size: 12px; margin-left: 4px; }
+
+/* ─── Position Monitor ─── */
+.pos-monitor { margin-bottom: 20px; }
+.pos-form {
+  background: #111827; border-radius: 12px; border: 1px solid #1f2937;
+  padding: 20px; margin-bottom: 16px;
+}
+.pos-form-title { font-size: 15px; font-weight: 600; color: #e5e7eb; margin-bottom: 14px; }
+.pos-form-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+.pos-field { display: flex; flex-direction: column; gap: 4px; }
+.pos-field label { font-size: 11px; color: #6b7280; text-transform: uppercase; }
+.pos-field input, .pos-field select {
+  background: #0d1220; border: 1px solid #374151; border-radius: 6px;
+  color: #e5e7eb; padding: 8px 12px; font-size: 14px; width: 130px;
+  font-variant-numeric: tabular-nums;
+}
+.pos-field select { width: 80px; cursor: pointer; }
+.pos-field input:focus, .pos-field select:focus { outline: none; border-color: #f7931a; }
+.pos-btn {
+  padding: 8px 20px; border-radius: 6px; border: none; cursor: pointer;
+  font-size: 13px; font-weight: 600; transition: all 0.2s;
+}
+.pos-btn-open { background: #f7931a; color: #000; }
+.pos-btn-open:hover { background: #e5850a; }
+.pos-btn-close { background: #374151; color: #e5e7eb; }
+.pos-btn-close:hover { background: #4b5563; }
+
+/* 操作信号卡片（核心） */
+.pos-action-card {
+  border-radius: 12px; padding: 24px; margin-bottom: 16px;
+  text-align: center; position: relative; overflow: hidden;
+}
+.pos-action-card.action-hold {
+  border: 2px solid rgba(34,197,94,0.5);
+  background: linear-gradient(180deg, rgba(34,197,94,0.08), #111827);
+}
+.pos-action-card.action-warn {
+  border: 2px solid rgba(234,179,8,0.5);
+  background: linear-gradient(180deg, rgba(234,179,8,0.08), #111827);
+}
+.pos-action-card.action-exit {
+  border: 2px solid rgba(239,68,68,0.5);
+  background: linear-gradient(180deg, rgba(239,68,68,0.08), #111827);
+}
+.pos-action-card.action-danger {
+  border: 2px solid rgba(239,68,68,0.8);
+  background: linear-gradient(180deg, rgba(239,68,68,0.15), #111827);
+  animation: danger-pulse 2s ease-in-out infinite;
+}
+@keyframes danger-pulse {
+  0%,100% { box-shadow: 0 0 0 rgba(239,68,68,0); }
+  50% { box-shadow: 0 0 30px rgba(239,68,68,0.15); }
+}
+.pos-action-label { font-size: 12px; color: #6b7280; margin-bottom: 6px; }
+.pos-action-text { font-size: 32px; font-weight: 800; margin-bottom: 8px; }
+.pos-action-reason { font-size: 14px; color: #9ca3af; margin-bottom: 12px; }
+.pos-action-meta { display: flex; justify-content: center; gap: 20px; flex-wrap: wrap; }
+.pos-action-tag {
+  padding: 6px 16px; border-radius: 8px; font-size: 14px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.pos-action-tag.target { background: rgba(34,197,94,0.12); color: #22c55e; }
+.pos-action-tag.stop { background: rgba(239,68,68,0.12); color: #ef4444; }
+
+/* 盈亏仪表盘 */
+.pos-dashboard {
+  background: #111827; border-radius: 12px; border: 1px solid #1f2937;
+  padding: 20px; margin-bottom: 16px;
+}
+.pos-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; flex-wrap: wrap; gap: 8px; }
+.pos-header-left { display: flex; align-items: center; gap: 12px; }
+.pos-side-badge {
+  font-size: 18px; font-weight: 700; padding: 4px 16px; border-radius: 8px;
+}
+.pos-side-badge.long { background: rgba(34,197,94,0.15); color: #22c55e; }
+.pos-side-badge.short { background: rgba(239,68,68,0.15); color: #ef4444; }
+.pos-header-info { font-size: 12px; color: #6b7280; }
+.pos-stats {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px; margin-bottom: 16px;
+}
+.pos-stat {
+  background: #0d1220; border-radius: 8px; border: 1px solid #1a2035;
+  padding: 12px; text-align: center;
+}
+.pos-stat-label { font-size: 11px; color: #6b7280; margin-bottom: 4px; text-transform: uppercase; }
+.pos-stat-value { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.pos-stat-sub { font-size: 11px; color: #6b7280; margin-top: 2px; }
+
+/* 价格轨道 */
+.pos-price-track {
+  background: #0d1220; border-radius: 10px; border: 1px solid #1a2035;
+  padding: 16px; margin-bottom: 16px;
+}
+.pos-track-title { font-size: 11px; color: #6b7280; margin-bottom: 12px; text-transform: uppercase; }
+.pos-track-bar {
+  position: relative; height: 8px; border-radius: 4px;
+  background: linear-gradient(90deg, #ef4444, #374151 30%, #374151 70%, #22c55e);
+  margin: 20px 0 12px;
+}
+.pos-track-marker {
+  position: absolute; top: -8px; width: 3px; height: 24px;
+  border-radius: 2px; transform: translateX(-50%);
+}
+.pos-track-label {
+  position: absolute; top: 18px; font-size: 10px; transform: translateX(-50%);
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.pos-track-labels { display: flex; justify-content: space-between; font-size: 11px; color: #6b7280; margin-top: 4px; }
+
+/* 趋势对齐 */
+.pos-alignment {
+  display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap;
+}
+.pos-align-item {
+  flex: 1; min-width: 90px; background: #0d1220; border-radius: 8px;
+  border: 1px solid #1a2035; padding: 10px; text-align: center;
+}
+.pos-align-label { font-size: 10px; color: #6b7280; margin-bottom: 4px; }
+.pos-align-value { font-size: 14px; font-weight: 700; }
+.pos-align-sub { font-size: 10px; color: #6b7280; margin-top: 2px; }
+
+/* 警告 */
+.pos-liq-warn {
+  display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+  background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.3);
+  border-radius: 8px; margin-bottom: 12px; font-size: 13px; color: #f87171;
+}
+
+.pos-no-position {
+  text-align: center; padding: 40px 20px; color: #6b7280;
+  background: #111827; border-radius: 12px; border: 1px solid #1f2937;
+}
+.pos-no-position-icon { font-size: 40px; margin-bottom: 12px; opacity: 0.5; }
+.pos-no-position-text { font-size: 14px; margin-bottom: 6px; }
+.pos-no-position-hint { font-size: 12px; color: #4b5563; }
+
+/* ─── Simulated Position ─── */
+.sim-card {
+  background: #111827; border-radius: 12px; border: 1px solid #8b5cf640;
+  padding: 20px; margin-top: 16px; position: relative;
+}
+.sim-badge {
+  display: inline-block; padding: 2px 10px; border-radius: 12px;
+  font-size: 11px; font-weight: 700; background: rgba(139,92,246,0.2);
+  color: #a78bfa; border: 1px solid rgba(139,92,246,0.3);
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.sim-stats-bar {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px; margin-top: 16px; margin-bottom: 0;
+}
+.sim-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.sim-side-badge {
+  font-size: 16px; font-weight: 700; padding: 4px 14px; border-radius: 8px;
+}
+.sim-side-badge.long { background: rgba(34,197,94,0.15); color: #22c55e; }
+.sim-side-badge.short { background: rgba(239,68,68,0.15); color: #ef4444; }
+.sim-stats {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 10px; margin-bottom: 12px;
+}
+.sim-stat {
+  background: #0d1220; border-radius: 8px; padding: 10px; text-align: center;
+}
+.sim-stat-label { font-size: 10px; color: #6b7280; margin-bottom: 4px; text-transform: uppercase; }
+.sim-stat-value { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.sim-history {
+  background: #111827; border-radius: 12px; border: 1px solid #1f2937;
+  padding: 20px; margin-top: 16px;
+}
+.sim-history-title { font-size: 14px; font-weight: 600; color: #e5e7eb; margin-bottom: 12px; }
+.sim-history-table { width: 100%; font-size: 12px; border-collapse: collapse; }
+.sim-history-table th {
+  text-align: left; color: #6b7280; font-weight: 500; padding: 8px 6px;
+  border-bottom: 1px solid #1f2937; font-size: 11px;
+}
+.sim-history-table td { padding: 8px 6px; border-bottom: 1px solid #111827; }
+
+/* Pagination */
+.sim-pagination { display: flex; align-items: center; gap: 6px; padding: 12px 8px; justify-content: center; }
+.sim-pagination button {
+  background: #1f2937; border: 1px solid #374151; color: #d1d5db; padding: 4px 10px;
+  border-radius: 4px; cursor: pointer; font-size: 12px;
+}
+.sim-pagination button:hover:not(:disabled) { background: #374151; color: #fff; }
+.sim-pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
+.sim-pagination button.active { background: #7c3aed; color: #fff; border-color: #7c3aed; }
+.sim-page-ellipsis { color: #6b7280; padding: 0 4px; }
+.sim-page-info { color: #6b7280; font-size: 12px; margin-left: 12px; }
+
+/* ─── Squeeze Alert ─── */
+.squeeze-panel {
+  display: flex; align-items: center; gap: 16px;
+  background: linear-gradient(135deg, rgba(234,179,8,0.08), rgba(247,147,26,0.08));
+  border: 1px solid rgba(234,179,8,0.3);
+  border-radius: 12px; padding: 16px 20px; margin-bottom: 16px;
+  animation: squeeze-pulse 3s ease-in-out infinite;
+}
+@keyframes squeeze-pulse {
+  0%,100% { box-shadow: 0 0 0 rgba(234,179,8,0); }
+  50% { box-shadow: 0 0 20px rgba(234,179,8,0.1); }
+}
+.squeeze-icon { font-size: 28px; flex-shrink: 0; }
+.squeeze-title { font-size: 15px; font-weight: 600; color: #eab308; margin-bottom: 4px; }
+.squeeze-desc { font-size: 13px; color: #9ca3af; line-height: 1.5; }
+
+/* ─── Entry Timing ─── */
+.entry-timing-panel {
+  background: #111827; border-radius: 12px; border: 1px solid #1f2937;
+  padding: 16px 20px; margin-bottom: 16px;
+}
+.timing-badge {
+  font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 20px;
+}
+.badge-good { background: rgba(34,197,94,0.15); color: #22c55e; border: 1px solid rgba(34,197,94,0.3); }
+.badge-ok { background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); }
+.badge-caution { background: rgba(234,179,8,0.15); color: #eab308; border: 1px solid rgba(234,179,8,0.3); }
+.badge-wait { background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid rgba(239,68,68,0.3); }
+.price-range-bar { margin-top: 4px; }
+.range-labels { display: flex; justify-content: space-between; font-size: 11px; color: #6b7280; margin-bottom: 4px; }
+.range-track {
+  position: relative; height: 8px; background: #1f2937; border-radius: 4px; overflow: visible;
+}
+.range-fill {
+  height: 100%; border-radius: 4px;
+  background: linear-gradient(90deg, #22c55e, #eab308, #ef4444);
+  opacity: 0.3;
+}
+.range-marker {
+  position: absolute; top: 50%; transform: translate(-50%, -50%);
+}
+.marker-dot {
+  width: 12px; height: 12px; border-radius: 50%; background: #fff; border: 2px solid #3b82f6;
+  box-shadow: 0 0 6px rgba(59,130,246,0.5);
+}
+.marker-price {
+  position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
+  font-size: 11px; color: #9ca3af; white-space: nowrap;
+}
+.timing-good .range-marker .marker-dot { border-color: #22c55e; box-shadow: 0 0 6px rgba(34,197,94,0.5); }
+.timing-caution .range-marker .marker-dot { border-color: #eab308; box-shadow: 0 0 6px rgba(234,179,8,0.5); }
+.timing-wait .range-marker .marker-dot { border-color: #ef4444; box-shadow: 0 0 6px rgba(239,68,68,0.5); }
+
+/* ─── Forecast Panel ─── */
+.forecast-panel {
+  background: #111827; border-radius: 12px; border: 1px solid #1f2937;
+  padding: 20px; margin-bottom: 16px;
+}
+.forecast-title {
+  font-size: 15px; font-weight: 600; color: #e5e7eb; margin-bottom: 14px;
+}
+.forecast-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+}
+.forecast-item {
+  background: #0d1220; border: 1px solid #1a2035; border-radius: 8px;
+  padding: 12px;
+}
+.forecast-label {
+  font-size: 11px; color: #6b7280; margin-bottom: 4px;
+}
+.forecast-value {
+  font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums;
+  color: #e5e7eb;
+}
+.forecast-sub {
+  font-size: 11px; font-weight: 400; color: #6b7280;
+}
+
+.up { color: #22c55e; }
+.down { color: #ef4444; }
+.warn { color: #f59e0b; }
+
+/* ─── Order Panel ─── */
+.order-panel {
+  margin: 14px 0; padding: 16px; border-radius: 14px;
+  border: 2px solid; background: #111827;
+}
+.order-long { border-color: #22c55e; }
+.order-short { border-color: #ef4444; }
+.order-wait { border-color: #6b7280; }
+.order-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.order-side { font-size: 20px; font-weight: 700; }
+.order-long .order-side { color: #22c55e; }
+.order-short .order-side { color: #ef4444; }
+.order-wait .order-side { color: #6b7280; }
+.order-confidence { font-size: 13px; font-weight: 600; padding: 4px 12px; border-radius: 20px; }
+.entry-market { font-size: 11px; padding: 3px 8px; border-radius: 4px; background: rgba(34,197,94,0.15); color: #22c55e; }
+.entry-limit { font-size: 11px; padding: 3px 8px; border-radius: 4px; background: rgba(59,130,246,0.15); color: #3b82f6; }
+.entry-wait { font-size: 11px; padding: 3px 8px; border-radius: 4px; background: rgba(239,68,68,0.15); color: #ef4444; }
+.conf-高 { background: rgba(34,197,94,0.15); color: #22c55e; }
+.conf-中 { background: rgba(234,179,8,0.15); color: #eab308; }
+.conf-低 { background: rgba(239,68,68,0.15); color: #ef4444; }
+.order-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.order-cell { padding: 8px 10px; background: rgba(0,0,0,0.25); border-radius: 8px; }
+.order-label { font-size: 11px; color: #6b7280; margin-bottom: 4px; }
+.order-value { font-size: 16px; font-weight: 700; font-family: 'SF Mono', Menlo, monospace; }
+.order-value.green { color: #22c55e; }
+.order-value.red { color: #ef4444; }
+.order-value.rr { color: #f59e0b; }
+.order-sub { font-size: 11px; color: #9ca3af; margin-top: 4px; }
+.order-footer { display: flex; gap: 16px; font-size: 12px; color: #6b7280; padding-top: 10px; border-top: 1px solid #1f2937; }
+.order-reason { font-size: 14px; color: #9ca3af; }
+
+.loading {
+  display: flex; align-items: center; justify-content: center;
+  height: 60vh; font-size: 16px; color: #6b7280;
+}
+.loading-spinner {
+  width: 30px; height: 30px; border: 3px solid #1f2937; border-top-color: #f7931a;
+  border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 12px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+footer {
+  text-align: center; padding: 20px; font-size: 12px; color: #4b5563;
+  border-top: 1px solid #1a2035;
+}
+</style>
+</head>
+<body>
+<script>
+const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
+</script>
+{% raw %}
+<div id="app">
+  <header class="header">
+    <h1><span>BTC</span> 合约信号 · 自进化系统</h1>
+    <div class="header-right">
+      <div style="display:flex;gap:4px">
+        <button class="tab-btn" :class="{active: tab==='signals'}" @click="tab='signals'">信号</button>
+        <button class="tab-btn" :class="{active: tab==='position'}" @click="tab='position'">持仓</button>
+        <button class="tab-btn" :class="{active: tab==='evolution'}" @click="tab='evolution'">进化</button>
+      </div>
+      <div class="user-bar">
+        <div class="live-badge">
+          <div class="live-dot"></div>
+          <span>{{ updateTime }}</span>
+        </div>
+        <button class="logout-btn" @click="logout">退出</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Ticker -->
+  <div class="ticker-bar" v-if="data">
+    <div class="ticker-item">
+      <span class="ticker-label">BTC/USDT 永续</span>
+      <span class="ticker-value price">{{ fmt(data.ticker.price) }}</span>
+    </div>
+    <div class="ticker-item">
+      <span class="ticker-label">24h涨跌</span>
+      <span class="ticker-value" :class="data.ticker.change_pct>=0?'up':'down'">
+        {{ data.ticker.change_pct>=0?'+':'' }}{{ data.ticker.change_pct.toFixed(2) }}%
+      </span>
+    </div>
+    <div class="ticker-item">
+      <span class="ticker-label">24h最高</span>
+      <span class="ticker-value">{{ fmt(data.ticker.high_24h) }}</span>
+    </div>
+    <div class="ticker-item">
+      <span class="ticker-label">24h最低</span>
+      <span class="ticker-value">{{ fmt(data.ticker.low_24h) }}</span>
+    </div>
+    <div class="ticker-item">
+      <span class="ticker-label">24h成交量</span>
+      <span class="ticker-value">{{ fmtVol(data.ticker.volume_24h) }}</span>
+    </div>
+  </div>
+
+  <div class="loading" v-if="!data">
+    <div class="loading-spinner"></div>
+    正在获取数据...
+  </div>
+
+  <div class="main" v-if="data">
+
+    <!-- ═══ 信号 Tab ═══ -->
+    <template v-if="tab==='signals' && data.verdict">
+      <!-- 主判断 -->
+      <div class="verdict-panel" :class="'verdict-'+data.verdict.signal">
+        <div class="verdict-regime">
+          {{ verdictRegimeText }}
+        </div>
+        <div class="verdict-summary">{{ data.verdict.summary }}</div>
+        <div class="verdict-confidence" v-if="data.verdict.regime==='trending'">
+          置信度 {{ data.verdict.confidence }}% · 强度 {{ data.verdict.strength }}
+          <span v-if="data.verdict.momentum"> · 动量{{ data.verdict.momentum }}</span>
+        </div>
+      </div>
+
+      <!-- 操作建议 -->
+      <div class="advice-panel" v-if="data.verdict.advice" :class="'advice-'+adviceType">
+        <div class="advice-action">{{ data.verdict.advice.action }}</div>
+        <div class="advice-reason">{{ data.verdict.advice.reason }}</div>
+        <div class="advice-targets" v-if="data.verdict.advice.target || data.verdict.advice.stop">
+          <span v-if="data.verdict.advice.target" class="advice-tag target">
+            目标 {{ fmt(data.verdict.advice.target) }}
+          </span>
+          <span v-if="data.verdict.advice.stop" class="advice-tag stop">
+            止损 {{ fmt(data.verdict.advice.stop) }}
+          </span>
+        </div>
+        <!-- 已持仓建议 -->
+        <div class="advice-positions" v-if="data.verdict.hold_long || data.verdict.hold_short">
+          <div class="advice-pos long" v-if="data.verdict.hold_long">
+            <span class="pos-label">多单</span>
+            <span class="pos-action">{{ data.verdict.hold_long.action }}</span>
+            <span class="pos-reason">{{ data.verdict.hold_long.reason }}</span>
+            <span class="pos-target" v-if="data.verdict.hold_long.target">目标 {{ fmt(data.verdict.hold_long.target) }}</span>
+            <span class="pos-stop" v-if="data.verdict.hold_long.stop">止损 {{ fmt(data.verdict.hold_long.stop) }}</span>
+          </div>
+          <div class="advice-pos short" v-if="data.verdict.hold_short">
+            <span class="pos-label">空单</span>
+            <span class="pos-action">{{ data.verdict.hold_short.action }}</span>
+            <span class="pos-reason">{{ data.verdict.hold_short.reason }}</span>
+            <span class="pos-target" v-if="data.verdict.hold_short.target">目标 {{ fmt(data.verdict.hold_short.target) }}</span>
+            <span class="pos-stop" v-if="data.verdict.hold_short.stop">止损 {{ fmt(data.verdict.hold_short.stop) }}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 下单信号 -->
+      <div v-if="data.verdict.order_signal && data.verdict.order_signal.side!=='观望'" class="order-panel" :class="'order-'+data.verdict.order_signal.side">
+        <div class="order-header">
+          <span class="order-side">{{ data.verdict.order_signal.side }}</span>
+          <span class="order-entry-type" :class="'entry-'+data.verdict.order_signal.entry_type">
+            {{ {market:'市价',limit:'限价',wait:'等待'}[data.verdict.order_signal.entry_type] || '市价' }}
+          </span>
+          <span class="order-confidence" :class="'conf-'+data.verdict.order_signal.confidence">
+            {{ data.verdict.order_signal.confidence }}信心
+          </span>
+        </div>
+        <div class="order-grid">
+          <div class="order-cell">
+            <div class="order-label">入场价</div>
+            <div class="order-value">{{ fmt(data.verdict.order_signal.entry_price) }}</div>
+            <div class="order-sub">{{ data.verdict.order_signal.entry_note }}</div>
+          </div>
+          <div class="order-cell">
+            <div class="order-label">目标价</div>
+            <div class="order-value green">{{ fmt(data.verdict.order_signal.target) }}</div>
+          </div>
+          <div class="order-cell">
+            <div class="order-label">止损价</div>
+            <div class="order-value red">{{ fmt(data.verdict.order_signal.stop) }}</div>
+          </div>
+          <div class="order-cell">
+            <div class="order-label">盈亏比</div>
+            <div class="order-value rr">{{ data.verdict.order_signal.rr_ratio }}</div>
+            <div class="order-sub" v-if="data.verdict.order_signal.current_rr && data.verdict.order_signal.entry_type !== 'market'">
+              现价 {{ data.verdict.order_signal.current_rr }}
+            </div>
+          </div>
+        </div>
+        <div class="order-footer">
+          <span>杠杆 {{ data.verdict.order_signal.leverage }}</span>
+          <span>风险 2%</span>
+          <span>仓位 ≤{{ data.verdict.order_signal.position_pct }}%</span>
+        </div>
+      </div>
+
+      <!-- 观望信号 -->
+      <div v-if="data.verdict.order_signal && data.verdict.order_signal.side==='观望'" class="order-panel order-wait">
+        <div class="order-header">
+          <span class="order-side">观望</span>
+        </div>
+        <div class="order-reason">{{ data.verdict.order_signal.entry_note }}</div>
+      </div>
+
+      <!-- 市场上下文（资金费率、OI、电路断路器） -->
+      <div v-if="data.verdict.market_context" style="background:#111827;border-radius:12px;border:1px solid #1f2937;padding:16px 20px;margin-bottom:16px">
+        <div style="font-size:13px;font-weight:600;color:#9ca3af;margin-bottom:12px">市场环境</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">
+          <div style="background:#0d1220;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:10px;color:#6b7280;margin-bottom:4px">资金费率</div>
+            <div style="font-size:16px;font-weight:700" :style="{color: marketContextFundingRateColor}">
+              {{ marketContextFundingRateText }}
+            </div>
+          </div>
+          <div style="background:#0d1220;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:10px;color:#6b7280;margin-bottom:4px">未平仓合约(OI)</div>
+            <div style="font-size:16px;font-weight:700;color:#e5e7eb">
+              {{ marketContextOIText }}
+            </div>
+            <div v-if="data.verdict.market_context.oi_divergence" style="font-size:10px;color:#ef4444;margin-top:2px">
+              &#9888; OI背离
+            </div>
+          </div>
+          <div style="background:#0d1220;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:10px;color:#6b7280;margin-bottom:4px">建议杠杆</div>
+            <div style="font-size:16px;font-weight:700;color:#e5e7eb">
+              {{ marketContextLeverageText }}
+            </div>
+          </div>
+          <div style="background:#0d1220;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:10px;color:#6b7280;margin-bottom:4px">每笔风险</div>
+            <div style="font-size:16px;font-weight:700;color:#e5e7eb">
+              {{ marketContextRiskText }}
+            </div>
+          </div>
+        </div>
+        <!-- 电路断路器警告 -->
+        <div v-if="marketContextCircuitBreakerWarning" style="margin-top:12px;padding:10px 14px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;font-size:13px;color:#f87171;display:flex;align-items:center;gap:8px">
+          &#9888; {{ marketContextCircuitBreakerWarning }}
+        </div>
+        <!-- 多时间框架对齐规则 -->
+        <div v-if="data.verdict.market_context.alignment_rule" style="margin-top:12px;padding:10px 14px;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.3);border-radius:8px;font-size:13px;color:#93c5fd">
+          &#128270; {{ data.verdict.market_context.alignment_rule }}
+        </div>
+        <!-- 波动率自适应阈值（分周期） -->
+        <div v-if="data.verdict.market_context.vol_threshold && data.verdict.market_context.vol_threshold.timeframes" style="margin-top:12px">
+          <div style="font-size:11px;color:#6b7280;margin-bottom:8px">各周期有效阈值</div>
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px">
+            <div v-for="(vt, tfKey) in data.verdict.market_context.vol_threshold.timeframes" :key="tfKey"
+                 style="background:#0d1220;border-radius:8px;padding:12px;text-align:center">
+              <div style="font-size:13px;font-weight:600;color:#93c5fd;margin-bottom:8px">{{ {['30m']:'30分钟',['1h']:'1小时',['4h']:'4小时'}[tfKey] || tfKey }} <span style="font-size:11px;color:#6b7280">(vol {{ vt.vol_percentile?.toFixed(0) }}%)</span></div>
+              <div style="display:flex;justify-content:space-around">
+                <div>
+                  <div style="font-size:10px;color:#6b7280;margin-bottom:2px">趋势</div>
+                  <div style="font-size:16px;font-weight:700;color:#e5e7eb">{{ vt.base_trending?.toFixed(0) }} → <span :style="{color: volAdjColor(vt.vol_percentile)}">{{ vt.effective_trending?.toFixed(1) }}</span></div>
+                </div>
+                <div>
+                  <div style="font-size:10px;color:#6b7280;margin-bottom:2px">形成</div>
+                  <div style="font-size:16px;font-weight:700;color:#e5e7eb">{{ vt.base_forming?.toFixed(0) }} → <span :style="{color: volAdjColor(vt.vol_percentile)}">{{ vt.effective_forming?.toFixed(1) }}</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 入场时机 -->
+      <div v-if="data.verdict.entry_timing" class="entry-timing-panel" :class="'timing-'+data.verdict.entry_timing.timing">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <div style="font-size:13px;font-weight:600;color:#9ca3af">入场时机</div>
+          <div class="timing-badge" :class="'badge-'+data.verdict.entry_timing.timing">
+            {{ data.verdict.entry_timing.label }}
+          </div>
+        </div>
+        <div style="font-size:13px;color:#d1d5db;margin-bottom:10px">{{ data.verdict.entry_timing.reason }}</div>
+        <!-- 价格位置条 -->
+        <div class="price-range-bar">
+          <div class="range-labels">
+            <span>支撑 {{ fmt(data.verdict.entry_timing.range_low) }}</span>
+            <span>阻力 {{ fmt(data.verdict.entry_timing.range_high) }}</span>
+          </div>
+          <div class="range-track">
+            <div class="range-fill" :style="{width: Math.min(100, Math.max(0, data.verdict.entry_timing.percentile))+'%'}"></div>
+            <div class="range-marker" :style="{left: Math.min(98, Math.max(2, data.verdict.entry_timing.percentile))+'%'}">
+              <div class="marker-dot"></div>
+              <div class="marker-price">{{ data.verdict.timeframes?.['30m']?.price ? fmt(data.verdict.timeframes['30m'].price) : '' }}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 波动率收缩预警 -->
+      <div class="squeeze-panel" v-if="data.verdict.squeeze && data.verdict.squeeze.active">
+        <div class="squeeze-icon">&#9889;</div>
+        <div class="squeeze-body">
+          <div class="squeeze-title">波动率收缩 · 蓄力中</div>
+          <div class="squeeze-desc">
+            {{ data.verdict.squeeze.src }} 波动率已收缩 {{ data.verdict.squeeze.compression }}%，
+            持续 {{ data.verdict.squeeze.duration_hours }}h，大波动即将到来
+          </div>
+        </div>
+      </div>
+
+      <!-- 趋势预判 -->
+      <div class="forecast-panel" v-if="data.verdict.forecast && data.verdict.regime==='trending'">
+        <div class="forecast-title">趋势预判</div>
+        <div class="forecast-grid">
+          <div class="forecast-item">
+            <div class="forecast-label">已走幅度</div>
+            <div class="forecast-value">{{ data.verdict.forecast.move_pct }}%
+              <span class="forecast-sub">({{ fmt(data.verdict.forecast.trend_start_price) }} → {{ fmt(data.verdict.forecast.trend_start_price + data.verdict.forecast.move_so_far * (data.verdict.direction==='bullish'?1:-1)) }})</span>
+            </div>
+          </div>
+          <div class="forecast-item">
+            <div class="forecast-label">保守目标</div>
+            <div class="forecast-value" :class="data.verdict.direction==='bullish'?'up':'down'">
+              {{ fmt(data.verdict.forecast.target_conserv) }}
+            </div>
+          </div>
+          <div class="forecast-item">
+            <div class="forecast-label">激进目标</div>
+            <div class="forecast-value" :class="data.verdict.direction==='bullish'?'up':'down'">
+              {{ fmt(data.verdict.forecast.target_aggress) }}
+            </div>
+          </div>
+          <div class="forecast-item">
+            <div class="forecast-label">ATR波幅</div>
+            <div class="forecast-value">{{ fmt(data.verdict.forecast.atr) }}</div>
+          </div>
+          <div class="forecast-item" v-if="data.verdict.forecast.remain_hours != null">
+            <div class="forecast-label">预计剩余</div>
+            <div class="forecast-value warn">~{{ data.verdict.forecast.remain_hours.toFixed(0) }}h</div>
+          </div>
+          <div class="forecast-item" v-else-if="data.verdict.momentum==='加速'">
+            <div class="forecast-label">预计剩余</div>
+            <div class="forecast-value up">趋势加速中</div>
+          </div>
+          <div class="forecast-item">
+            <div class="forecast-label">ADX峰值/回落</div>
+            <div class="forecast-value" :class="data.verdict.forecast.adx_drop>5?'warn':''">
+              {{ data.verdict.forecast.adx_peak }} / -{{ data.verdict.forecast.adx_drop.toFixed(0) }}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 分析细节 -->
+      <div class="verdict-details">
+        <div class="detail-item" v-for="d in data.verdict.details" :key="d">{{ d }}</div>
+      </div>
+
+      <!-- 三个时间框架 ADX 对比 -->
+      <div class="tf-grid">
+        <div class="tf-card" v-for="(tf_data, tf) in data.verdict.timeframes" :key="tf">
+          <div class="tf-label">{{ {['30m']:'30分钟',['1h']:'1小时',['4h']:'4小时'}[tf] || tf }}</div>
+          <div class="tf-adx" :class="tf_data.adx>=25?'up':tf_data.adx>=20?'warn':''">
+            ADX {{ tf_data.adx != null ? tf_data.adx.toFixed(0) : '-' }}
+          </div>
+          <div class="tf-di" :class="tf_data.direction==='bullish'?'up':'down'">
+            +DI {{ tf_data.plus_di?.toFixed(0) || '-' }} / -DI {{ tf_data.minus_di?.toFixed(0) || '-' }}
+          </div>
+          <div class="tf-regime">
+            {{ tfRegimeText(tf_data.regime, tf_data.direction) }}
+          </div>
+          <div class="tf-duration" v-if="tf_data.duration_hours > 0">
+            持续 {{ tf_data.duration_hours >= 1 ? tf_data.duration_hours.toFixed(0)+'h' : (tf_data.duration_hours*60).toFixed(0)+'m' }}
+          </div>
+          <div class="tf-vol" v-if="tf_data.vol_trend">
+            量能 {{ tf_data.vol_trend.toFixed(2) }}x
+          </div>
+          <div class="tf-squeeze" v-if="tf_data.squeeze && tf_data.squeeze.active">
+            &#9889; 收缩 {{ tf_data.squeeze.compression }}%
+          </div>
+          <div class="tf-divergence" v-if="tf_data.price_structure && tf_data.price_structure.adx_divergence">
+            &#9888; 价格结构背离
+          </div>
+          <div class="tf-vol" v-if="tf_data.vol_percentile != null">
+            波动率百分位 {{ tf_data.vol_percentile.toFixed(0) }}%
+          </div>
+          <div class="tf-vol" v-if="tf_data.di_spread != null">
+            DI价差 {{ tf_data.di_spread.toFixed(1) }}<span v-if="tf_data.di_spread < 3" style="color:#ef4444"> ⚠过低</span>
+          </div>
+          <div class="tf-vol" v-if="tf_data.adx_decay != null && Math.abs(tf_data.adx_decay) > 3">
+            ADX趋势 {{ tf_data.adx_decay > 0 ? '强化' : '衰减' }} {{ tf_data.adx_decay > 0 ? '+' : '' }}{{ tf_data.adx_decay.toFixed(1) }}
+          </div>
+        </div>
+      </div>
+
+      <!-- 趋势历史 -->
+      <div class="history-panel" v-if="dedupedHistory.length">
+        <div class="history-title">趋势历史</div>
+        <div class="history-list">
+          <div class="history-item" v-for="(h, i) in dedupedHistory" :key="i"
+               :class="h.direction==='bullish'?'h-bull':h.direction==='bearish'?'h-bear':''">
+            <span class="h-time">{{ h.time }}</span>
+            <span class="h-price">{{ h.price ? fmt(h.price) : '-' }}</span>
+            <span class="h-regime" :class="hRegimeClass(h.regime, h.direction)">
+              {{ hRegimeText(h.regime, h.direction) }}
+            </span>
+            <span class="h-strength" v-if="h.regime==='trending'">{{ h.strength }}</span>
+            <span class="h-adx">4h:{{ h.adx_4h?.toFixed(0)||'-' }} 1h:{{ h.adx_1h?.toFixed(0)||'-' }}</span>
+            <span class="h-advice" :class="h.advice&&(h.advice.includes('做')?'act':h.advice.includes('减')||h.advice.includes('离')?'exit':'')">{{ h.advice || '-' }}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 30m 当前K线快照 -->
+      <div class="snapshot-panel" v-if="data.m30_snapshots && data.m30_snapshots.length">
+        <div class="snapshot-title">30m 当前K线内记录 <span style="color:#4b5563;font-weight:400">({{ data.m30_snapshots.length }}条)</span></div>
+        <div class="snapshot-list">
+          <div class="snapshot-item" v-for="(s, i) in data.m30_snapshots" :key="i"
+               :class="s.direction==='bullish'?'snap-up':'snap-down'">
+            <span class="snap-time">{{ s.time }}</span>
+            <span class="snap-price">{{ fmt(s.price) }}</span>
+            <span class="snap-adx">ADX {{ s.adx }}</span>
+            <span class="snap-di" :class="s.plus_di > s.minus_di ? 'up' : 'down'">
+              +{{ s.plus_di?.toFixed(0) }} / -{{ s.minus_di?.toFixed(0) }}
+            </span>
+            <span class="snap-regime" :class="hRegimeClass(s.regime, s.direction)">
+              {{ hRegimeText(s.regime, s.direction) }}
+            </span>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- ═══ 持仓 Tab ═══ -->
+    <template v-if="tab==='position'">
+      <div class="pos-monitor">
+        <!-- 模拟仓位统计卡片 -->
+        <div class="sim-stats-bar" v-if="simPosition || simStats.total_trades > 0">
+          <div class="sim-stat">
+            <div class="sim-stat-label">模拟资产</div>
+            <div class="sim-stat-value" style="color:#fff">{{ simStats.current_balance.toFixed(2) }} U</div>
+          </div>
+          <div class="sim-stat">
+            <div class="sim-stat-label">可用余额</div>
+            <div class="sim-stat-value" style="color:#fbbf24">{{ simStats.available_balance.toFixed(2) }} U</div>
+          </div>
+          <div class="sim-stat">
+            <div class="sim-stat-label">已实现盈亏</div>
+            <div class="sim-stat-value" :class="simStats.realized_pnl >= 0 ? 'up' : 'down'">
+              {{ simStats.realized_pnl >= 0 ? '+' : '' }}{{ simStats.realized_pnl.toFixed(2) }} U
+            </div>
+          </div>
+          <div class="sim-stat">
+            <div class="sim-stat-label">今日盈亏</div>
+            <div class="sim-stat-value" :class="simStats.today_pnl >= 0 ? 'up' : 'down'">
+              {{ simStats.today_pnl >= 0 ? '+' : '' }}{{ simStats.today_pnl.toFixed(2) }} U
+              <span style="font-size:11px;color:#6b7280">({{ simStats.today_trades }} 笔)</span>
+            </div>
+          </div>
+          <div class="sim-stat">
+            <div class="sim-stat-label">总交易次数</div>
+            <div class="sim-stat-value" style="color:#9ca3af">{{ simStats.total_trades }}</div>
+          </div>
+        </div>
+
+        <div class="sim-card" v-if="simPosition">
+          <div class="sim-header">
+            <span class="sim-badge">模拟</span>
+            <span class="sim-side-badge" :class="simPosition.side">
+              {{ simPosition.side === 'long' ? '多' : '空' }} {{ simPosition.leverage }}x
+            </span>
+            <span style="font-size:12px;color:#6b7280">
+              仓位 {{ simPositionSize }} BTC · {{ fmt(simNotionalValue) }} U
+              · 入场 {{ fmt(simPosition.entry_price) }} · {{ simHoldTime }}
+            </span>
+          </div>
+          <div class="sim-stats">
+            <div class="sim-stat">
+              <div class="sim-stat-label">当前价格</div>
+              <div class="sim-stat-value" style="color:#fff">{{ fmt(data.ticker.price) }}</div>
+            </div>
+            <div class="sim-stat">
+              <div class="sim-stat-label">浮动盈亏</div>
+              <div class="sim-stat-value" :class="simPnl >= 0 ? 'up' : 'down'">
+                {{ simPnl >= 0 ? '+' : '' }}{{ simPnl.toFixed(2) }}%
+              </div>
+            </div>
+            <div class="sim-stat" v-if="simPosition.target">
+              <div class="sim-stat-label">目标</div>
+              <div class="sim-stat-value" style="color:#22c55e">{{ fmt(simPosition.target) }}</div>
+            </div>
+            <div class="sim-stat" v-if="simPosition.stop">
+              <div class="sim-stat-label">止损</div>
+              <div class="sim-stat-value" style="color:#ef4444">{{ fmt(simPosition.stop) }}</div>
+              <div class="sim-stat-sub" :style="{color: simStopDistColor}">{{ simStopDist }}</div>
+            </div>
+            <div class="sim-stat">
+              <div class="sim-stat-label">状态</div>
+              <div class="sim-stat-value" style="font-size:14px;color:#a78bfa">
+                {{ simActionStateText }}
+              </div>
+            </div>
+            <div class="sim-stat" style="grid-column:span 2">
+              <div class="sim-stat-label">开仓原因</div>
+              <div class="sim-stat-value" style="font-size:12px;color:#9ca3af">
+                {{ simPosition.entry_reason || '-' }}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 无模拟仓位提示 -->
+        <div v-if="!simPosition" style="text-align:center;padding:16px;color:#4b5563;font-size:13px;margin-top:12px;background:#111827;border-radius:8px;border:1px solid #1f2937">
+          <span class="sim-badge" style="margin-right:6px">模拟</span> 暂无模拟仓位，等待信号触发自动开仓
+        </div>
+
+        <!-- 模拟仓位历史记录 -->
+        <div class="sim-history" v-if="simHistory && simHistory.length > 0">
+          <div class="sim-history-title">模拟仓位历史记录</div>
+          <table class="sim-history-table">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>操作</th>
+                <th>方向</th>
+                <th>价格</th>
+                <th>仓位大小</th>
+                <th>保证金</th>
+                <th>杠杆</th>
+                <th>盈亏</th>
+                <th>详情</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <template v-for="(h, i) in simHistory" :key="h.action_id || h.id || i">
+              <tr>
+                <td style="font-family:monospace;color:#6b7280">{{ fmtClock(h.created_at) }}</td>
+                <td :style="{fontWeight:600, color: histActionColor(h)}">{{ histActionLabel(h) }}</td>
+                <td>
+                  <span :class="h.side === 'long' ? 'up' : 'down'" style="font-weight:600">
+                    {{ h.side === 'long' ? '多' : '空' }}
+                  </span>
+                </td>
+                <td style="font-family:monospace">{{ fmt(histPrice(h)) }}</td>
+                <td style="font-family:monospace">{{ histPositionSize(h) }} BTC</td>
+                <td style="font-family:monospace">{{ histMargin(h) }} U</td>
+                <td>{{ h.leverage }}x</td>
+                <td v-if="h.action === 'close' || h.action === 'close_stop' || h.action === 'close_tp'" :class="(h.pnl||0) >= 0 ? 'up' : 'down'" style="font-weight:700">
+                  {{ (h.pnl||0) >= 0 ? '+' : '' }}{{ (h.pnl||0).toFixed(2) }} U
+                </td>
+                <td v-else style="color:#6b7280">-</td>
+                <td style="font-size:11px;color:#6b7280">{{ histDetail(h) }}</td>
+                <td style="font-size:11px;color:#6b7280">{{ histStatus(h) }}</td>
+              </tr>
+            </template>
+          </table>
+          <!-- Pagination -->
+          <div class="sim-pagination" v-if="simTotalPages > 1">
+            <button @click="simPagePrev" :disabled="simPage <= 1">‹ 上一页</button>
+            <template v-for="p in simTotalPages" :key="p">
+              <button v-if="simTotalPages <= 7 || p === 1 || p === simTotalPages || Math.abs(p - simPage) <= 1"
+                      @click="simPageTo(p)"
+                      :class="{ active: p === simPage }">{{ p }}</button>
+              <span v-else-if="p === 2 && simPage > 3" class="sim-page-ellipsis">…</span>
+              <span v-else-if="p === simTotalPages - 1 && simPage < simTotalPages - 2" class="sim-page-ellipsis">…</span>
+            </template>
+            <button @click="simPageNext" :disabled="simPage >= simTotalPages">下一页 ›</button>
+            <span class="sim-page-info">{{ simPage }} / {{ simTotalPages }} (共 {{ simTotal }} 条)</span>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- ═══ 进化 Tab ═══ -->
+    <template v-if="tab==='evolution' && data.evolution">
+      <div class="evo-section">
+        <h3>趋势判断验证</h3>
+
+        <!-- 总览 -->
+        <div class="evo-overview">
+          <div class="evo-stat">
+            <div class="evo-stat-label">总判断次数</div>
+            <div class="evo-stat-value">{{ data.evolution.total_predictions }}</div>
+          </div>
+          <div class="evo-stat">
+            <div class="evo-stat-label">已验证</div>
+            <div class="evo-stat-value">{{ data.evolution.total_verified }}</div>
+          </div>
+          <div class="evo-stat">
+            <div class="evo-stat-label">待验证</div>
+            <div class="evo-stat-value">{{ data.evolution.total_predictions - data.evolution.total_verified }}</div>
+          </div>
+        </div>
+
+        <!-- 各时间框架详情 -->
+        <div class="evo-tf-grid">
+          <div class="evo-tf-card" v-for="(tf, tfKey) in data.evolution.timeframes" :key="tfKey">
+            <div class="evo-tf-title">
+              <span>{{ {'30m':'30分钟','1h':'1小时','4h':'4小时'}[tfKey] || tfKey }}</span>
+              <span class="evo-accuracy" :class="accClass(tf.regime_accuracy)">
+                {{ tf.regime_accuracy !== null ? tf.regime_accuracy + '% 趋势判断' : '数据积累中' }}
+              </span>
+            </div>
+
+            <!-- 统计 -->
+            <div style="display:flex;gap:16px;margin-bottom:12px;font-size:12px;color:#9ca3af;flex-wrap:wrap">
+              <span>判断: {{ tf.total }}</span>
+              <span>验证: {{ tf.verified }}</span>
+              <span class="up">趋势正确: {{ tf.regime_correct }}</span>
+              <span>待验: {{ tf.pending }}</span>
+            </div>
+
+            <!-- 准确率条 -->
+            <div style="margin-bottom:14px">
+              <div class="weight-row">
+                <span class="weight-name" style="width:80px">趋势判断</span>
+                <div class="weight-bar-bg">
+                  <div class="weight-bar-fill" :style="{width: (tf.regime_accuracy||0)+'%', background: weightColor(tf.regime_accuracy)}"></div>
+                </div>
+                <span class="weight-acc" :class="tf.regime_accuracy!==null?(tf.regime_accuracy>=60?'up':tf.regime_accuracy<45?'down':''):''">
+                  {{ tf.regime_accuracy !== null ? tf.regime_accuracy + '%' : '-' }}
+                </span>
+              </div>
+              <div class="weight-row">
+                <span class="weight-name" style="width:80px">方向判断</span>
+                <div class="weight-bar-bg">
+                  <div class="weight-bar-fill" :style="{width: (tf.dir_accuracy||0)+'%', background: weightColor(tf.dir_accuracy)}"></div>
+                </div>
+                <span class="weight-acc" :class="tf.dir_accuracy!==null?(tf.dir_accuracy>=60?'up':tf.dir_accuracy<45?'down':''):''">
+                  {{ tf.dir_accuracy !== null ? tf.dir_accuracy + '%' : '-' }}
+                  <span style="color:#6b7280;font-size:10px" v-if="tf.dir_total">({{ tf.dir_correct }}/{{ tf.dir_total }})</span>
+                </span>
+              </div>
+            </div>
+
+            <!-- MFE/MAE 统计 -->
+            <div v-if="tf.mfe_mae_stats" style="margin-bottom:14px;padding:10px;background:#0d1220;border-radius:8px">
+              <div style="font-size:11px;color:#6b7280;margin-bottom:8px">MFE/MAE 统计</div>
+              <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;font-size:12px">
+                <div style="text-align:center">
+                  <div style="color:#6b7280;font-size:10px">平均MFE</div>
+                  <div style="color:#22c55e;font-weight:600">{{ tf.mfe_mae_stats.avg_mfe?.toFixed(1) }}%</div>
+                </div>
+                <div style="text-align:center">
+                  <div style="color:#6b7280;font-size:10px">平均MAE</div>
+                  <div style="color:#ef4444;font-weight:600">{{ tf.mfe_mae_stats.avg_mae?.toFixed(1) }}%</div>
+                </div>
+                <div style="text-align:center">
+                  <div style="color:#6b7280;font-size:10px">MFE/MAE比</div>
+                  <div style="font-weight:600" :style="{color: (tf.mfe_mae_stats.mfe_mae_ratio > 2.5 || tf.mfe_mae_stats.mfe_mae_ratio < 1.2) ? '#f59e0b' : '#22c55e'}">{{ tf.mfe_mae_stats.mfe_mae_ratio?.toFixed(1) }}</div>
+                </div>
+                <div style="text-align:center">
+                  <div style="color:#6b7280;font-size:10px">目标命中率</div>
+                  <div style="font-weight:600" :style="{color: tf.mfe_mae_stats.target_hit_rate > 50 ? '#22c55e' : '#9ca3af'}">{{ tf.mfe_mae_stats.target_hit_rate }}%</div>
+                </div>
+                <div style="text-align:center">
+                  <div style="color:#6b7280;font-size:10px">止损命中率</div>
+                  <div style="font-weight:600" :style="{color: tf.mfe_mae_stats.stop_hit_rate > 40 ? '#ef4444' : '#9ca3af'}">{{ tf.mfe_mae_stats.stop_hit_rate }}%</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 最近判断记录 -->
+            <table class="recent-table" v-if="tf.recent && tf.recent.length">
+              <thead>
+                <tr><th>判断</th><th>ADX</th><th>价格</th><th>结果价</th><th>趋势</th><th>方向</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="(r,i) in tf.recent" :key="i">
+                  <td>
+                    <span :class="r.regime==='trending'?(r.direction==='bullish'?'up':'down'):r.regime==='breakout'?'up':r.regime==='exhaustion'||r.regime==='high_volatility'?'warn':''" style="font-size:12px">
+                      {{ hRegimeText(r.regime, r.direction) }}
+                    </span>
+                  </td>
+                  <td>{{ r.adx ? r.adx.toFixed(0) : '-' }}</td>
+                  <td>{{ fmt(r.price_at_signal) }}</td>
+                  <td>{{ r.verified ? fmt(r.price_at_verify) : '-' }}</td>
+                  <td>
+                    <span v-if="!r.verified" class="result-pending">待验</span>
+                    <span v-else-if="r.regime_correct" class="result-correct">✓</span>
+                    <span v-else class="result-wrong">✗</span>
+                  </td>
+                  <td>
+                    <span v-if="r.direction_correct===null" style="color:#4b5563">-</span>
+                    <span v-else-if="r.direction_correct" class="result-correct">✓</span>
+                    <span v-else class="result-wrong">✗</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-else style="color:#4b5563;font-size:12px;text-align:center;padding:10px">暂无判断记录</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 各周期阈值（有效值 = 基础值 + 波动率调整） -->
+      <div class="evo-section" v-if="data.evolution.evolution_params && data.evolution.evolution_params.tf_thresholds">
+        <h3>各周期独立阈值</h3>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px">
+          <div v-for="(tf, name) in data.evolution.evolution_params.tf_thresholds" :key="name"
+               style="background:#0d1220;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:13px;font-weight:600;color:#93c5fd;margin-bottom:8px">{{ name }} <span style="font-size:11px;color:#6b7280">(vol% {{ tfVolPercent(name) }})</span></div>
+            <div style="display:flex;justify-content:space-around">
+              <div>
+                <div style="font-size:10px;color:#6b7280;margin-bottom:2px">趋势</div>
+                <div style="font-size:16px;font-weight:700;color:#e5e7eb">{{ tfBase(name, 'trending') }} → <span :style="{color: volAdjColor(name, 'trending')}">{{ tfEff(name, 'trending') }}</span></div>
+              </div>
+              <div>
+                <div style="font-size:10px;color:#6b7280;margin-bottom:2px">形成</div>
+                <div style="font-size:16px;font-weight:700;color:#e5e7eb">{{ tfBase(name, 'forming') }} → <span :style="{color: volAdjColor(name, 'forming')}">{{ tfEff(name, 'forming') }}</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 进化参数 -->
+      <div class="evo-section" v-if="data.evolution.evolution_params">
+        <h3>全局进化参数</h3>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">
+          <div style="background:#0d1220;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:10px;color:#6b7280;margin-bottom:4px">ADX趋势阈值</div>
+            <div style="font-size:16px;font-weight:700;color:#e5e7eb">{{ data.evolution.evolution_params.adx_trending_threshold }}</div>
+          </div>
+          <div style="background:#0d1220;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:10px;color:#6b7280;margin-bottom:4px">ADX形成阈值</div>
+            <div style="font-size:16px;font-weight:700;color:#e5e7eb">{{ data.evolution.evolution_params.adx_forming_threshold }}</div>
+          </div>
+          <div style="background:#0d1220;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:10px;color:#6b7280;margin-bottom:4px">DI价差最小值</div>
+            <div style="font-size:16px;font-weight:700;color:#e5e7eb">{{ data.evolution.evolution_params.min_di_spread }}</div>
+          </div>
+          <div style="background:#0d1220;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:10px;color:#6b7280;margin-bottom:4px">波动率调整系数</div>
+            <div style="font-size:16px;font-weight:700;color:#e5e7eb">{{ data.evolution.evolution_params.vol_adjustment_factor }}</div>
+          </div>
+          <div style="background:#0d1220;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:10px;color:#6b7280;margin-bottom:4px">ATR止损倍数</div>
+            <div style="font-size:16px;font-weight:700;color:#22c55e">{{ data.evolution.evolution_params.atr_stop_multiplier?.toFixed(1) }}</div>
+          </div>
+          <div style="background:#0d1220;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:10px;color:#6b7280;margin-bottom:4px">最低RR比</div>
+            <div style="font-size:16px;font-weight:700;color:#22c55e">{{ data.evolution.evolution_params.rr_ratio?.toFixed(1) }}</div>
+          </div>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <footer>
+    仅供参考，不构成投资建议 | 数据来源: Binance Futures | 每10秒更新 | 信号自动复盘 & 权重自进化
+  </footer>
+</div>
+
+<script>
+const { createApp, ref, computed, watch, onMounted, onUnmounted } = Vue;
+
+// 从服务端注入的初始配置 (window.SIM_INITIAL_BALANCE set above raw block)
+
+createApp({
+  setup() {
+    const data = ref(null);
+    const tab = ref('signals');
+    const updateTime = ref('');
+    let ws = null;
+
+    // ── 模拟仓位 ──
+    const simPosition = ref(null);
+    const simHistory = ref([]);
+    const simPage = ref(1);
+    const simPageSize = ref(10);
+    const simTotalPages = ref(0);
+    const simTotal = ref(0);
+    const simStats = ref({ initial_balance: 10000, current_balance: 10000, realized_pnl: 0, today_pnl: 0, total_trades: 0, today_trades: 0, available_balance: 10000, margin_used: 0 });
+
+    // ── 模拟仓位加载 ──
+    const loadSimPosition = async () => {
+      try {
+        const resp = await fetch('/api/position/simulated');
+        if (resp.ok) {
+          simPosition.value = await resp.json();
+        }
+      } catch(e) {}
+    };
+
+    const loadSimHistory = async () => {
+      try {
+        const resp = await fetch(`/api/positions/simulated/history?page=${simPage.value}&page_size=${simPageSize.value}`);
+        if (resp.ok) {
+          const d = await resp.json();
+          simHistory.value = d.positions || [];
+          simTotal.value = d.total || 0;
+          simTotalPages.value = d.total_pages || 0;
+        }
+      } catch(e) {}
+    };
+
+    const simPagePrev = () => { if (simPage.value > 1) { simPage.value--; loadSimHistory(); } };
+    const simPageNext = () => { if (simPage.value < simTotalPages.value) { simPage.value++; loadSimHistory(); } };
+    const simPageTo = (p) => { simPage.value = p; loadSimHistory(); };
+
+    const loadSimStats = async () => {
+      try {
+        const resp = await fetch('/api/position/simulated/stats');
+        if (resp.ok) {
+          simStats.value = await resp.json();
+        }
+      } catch(e) {}
+    };
+
+    // 模拟仓位实时 PnL
+    const simPnl = computed(() => {
+      if (!simPosition.value || !currentPrice.value) return 0;
+      const p = simPosition.value;
+      const diff = (currentPrice.value - p.entry_price) / p.entry_price * 100;
+      return (p.side === 'long' ? diff : -diff) * (p.leverage || 5);
+    });
+
+    // 模拟仓位动态止损距离
+    const simStopDist = computed(() => {
+      if (!simPosition.value || !currentPrice.value || !simPosition.value.stop) return '';
+      const dist = (simPosition.value.stop - currentPrice.value) / currentPrice.value * 100;
+      const sign = simPosition.value.side === 'long' ? -dist : dist;
+      return (sign >= 0 ? '距止损 +' : '已触发止损 ') + Math.abs(sign).toFixed(2) + '%';
+    });
+
+    const simStopDistColor = computed(() => {
+      if (!simPosition.value || !currentPrice.value || !simPosition.value.stop) return '#6b7280';
+      const dist = Math.abs(simPosition.value.stop - currentPrice.value) / currentPrice.value * 100;
+      if (dist < 2) return '#ef4444';
+      if (dist < 5) return '#eab308';
+      return '#22c55e';
+    });
+
+    const simHoldTime = computed(() => {
+      if (!simPosition.value) return '';
+      const ms = Date.now() - (simPosition.value.created_at * 1000);
+      const h = Math.floor(ms / 3600000);
+      const m = Math.floor((ms % 3600000) / 60000);
+      if (h >= 24) return Math.floor(h / 24) + '天' + (h % 24) + '时';
+      if (h > 0) return h + '时' + m + '分';
+      return m + '分钟';
+    });
+
+    const simActionStateText = computed(() => {
+      if (!simPosition.value) return '';
+      const state = simPosition.value.action_state || 'open';
+      const reduceCount = simPosition.value.reduce_count || 0;
+      const addCount = simPosition.value.add_count || 0;
+      const text = { open: '持仓', add: '加仓', reduced: '已减仓', exited: '已退出' }[state] || state;
+      const parts = [text];
+      if (addCount > 0) parts.push(`加仓${addCount}次`);
+      if (reduceCount > 0) parts.push(`减仓${reduceCount}次`);
+      return parts.join(' · ');
+    });
+
+    // 仓位大小：BTC数量 = 假设初始余额10000U的2%风险 / 止损距离 * 入场价 反推
+    // 实际开仓时 leverage=5, 按 2% 风控, position notional = sim_initial_balance * 0.02 * leverage / (stop_distance_pct/100)
+    // 简化：直接从 entry_price * leverage 反推名义价值 / 入场价
+    const simPositionSize = computed(() => {
+      if (!simPosition.value || !currentPrice.value) return '-';
+      const p = simPosition.value;
+      const entry = p.entry_price;
+      const stop = p.stop;
+      // 按 2% 风控模型: risk_amount = SIM_INITIAL_BALANCE * 0.02
+      // btc_size = risk_amount / |entry - stop| * leverage
+      if (stop && stop !== entry) {
+        const riskAmt = (window.SIM_INITIAL_BALANCE || 10000) * 0.02;
+        const btcSize = riskAmt / Math.abs(entry - stop) * (p.leverage || 5);
+        return btcSize.toFixed(4);
+      }
+      // 无止损时按默认仓位显示
+      const defaultNotional = (window.SIM_INITIAL_BALANCE || 10000) * (p.leverage || 5);
+      return (defaultNotional / entry).toFixed(4);
+    });
+
+    const simNotionalValue = computed(() => {
+      if (!simPosition.value || !currentPrice.value) return 0;
+      const size = parseFloat(simPositionSize.value) || 0;
+      return size * currentPrice.value;
+    });
+
+    // Flat history helpers
+    const histActionLabel = (h) => {
+      const a = h.action || '';
+      if (a === 'open') return '开仓';
+      if (a.startsWith('add')) return '加仓';
+      if (a.startsWith('reduce')) return '减仓';
+      if (a.startsWith('close') || a === 'exit') return '平仓';
+      return a;
+    };
+    const histActionColor = (h) => {
+      const a = h.action || '';
+      if (a === 'open') return '#60a5fa';
+      if (a.startsWith('add')) return '#fbbf24';
+      if (a.startsWith('reduce')) return '#f87171';
+      return '#ef4444';
+    };
+    const histPrice = (h) => h.price || h.entry_price || h.close_price || 0;
+    const histPositionSize = (h) => {
+      if (h.position_size) return parseFloat(h.position_size).toFixed(4);
+      // Fallback: calculate from entry_price
+      const entry = h.entry_price;
+      const stop = h.stop;
+      const lev = h.leverage || 5;
+      const initBal = window.SIM_INITIAL_BALANCE || 10000;
+      if (stop && stop !== entry) {
+        const riskAmt = initBal * 0.02;
+        return (riskAmt / Math.abs(entry - stop) * lev).toFixed(4);
+      }
+      return ((initBal * lev) / entry).toFixed(4);
+    };
+    const histMargin = (h) => {
+      const size = parseFloat(histPositionSize(h)) || 0;
+      const price = histPrice(h);
+      const lev = h.leverage || 5;
+      if (size > 0 && price > 0) {
+        const notional = size * price;
+        return (notional / lev).toFixed(2);
+      }
+      return '-';
+    };
+    const histDetail = (h) => {
+      const a = h.action || '';
+      if (a === 'open') return h.entry_reason || '-';
+      if (a.startsWith('add')) return `加仓 ${h.position_size?.toFixed(4) || '-'} BTC`;
+      if (a.startsWith('reduce')) return `减仓 ${h.position_size?.toFixed(4) || '-'} BTC`;
+      return simCloseReasonText(h.close_reason) || '-';
+    };
+    const histStatus = (h) => {
+      if (h.action === 'open') return h.status === 'closed' ? '已平' : '持仓中';
+      return '-';
+    };
+
+    const simCloseReasonText = (reason) => {
+      if (!reason) return '-';
+      return {
+        stop_loss: '止损',
+        take_profit: '止盈',
+        signal_reversal: '信号反转',
+        signal_exit: '信号退出',
+        reduce_exit: '减仓退出',
+        reduce_max: '多次减仓',
+        emergency_high_vol: '高波动离场',
+        emergency_adx_dead: '趋势衰竭',
+        adx_trailing_stop: 'ADX趋势跟踪止损',
+        manual: '手动平仓',
+      }[reason] || reason;
+    };
+
+    const simHistSize = (h) => {
+      const entry = h.entry_price;
+      const stop = h.stop;
+      const lev = h.leverage || 5;
+      const initBal = window.SIM_INITIAL_BALANCE || 10000;
+      if (stop && stop !== entry) {
+        const riskAmt = initBal * 0.02;
+        return (riskAmt / Math.abs(entry - stop) * lev).toFixed(4);
+      }
+      return ((initBal * lev) / entry).toFixed(4);
+    };
+
+    const simHistMargin = (h) => {
+      const size = parseFloat(simHistSize(h)) || 0;
+      const entry = h.entry_price || 0;
+      const lev = h.leverage || 5;
+      const notional = size * entry;
+      return (notional / lev).toFixed(2);
+    };
+
+    const currentPrice = computed(() => data.value?.ticker?.price || 0);
+
+    const sigText = s => ({bullish:'看涨',bearish:'看跌',neutral:'震荡'}[s]||s);
+
+    // Unified regime display mapping
+    const tfRegimeText = (regime, direction) => {
+      if (regime === 'trending') return direction === 'bullish' ? '看涨' : '看跌';
+      if (regime === 'forming') return direction === 'bullish' ? '转涨形成中' : '转跌形成中';
+      if (regime === 'breakout') return direction === 'bullish' ? '突破·看涨' : '突破·看跌';
+      if (regime === 'exhaustion') return direction === 'bullish' ? '衰竭·多' : '衰竭·空';
+      if (regime === 'high_volatility') return '高波动';
+      if (regime === 'low_volatility') return '低波动';
+      return '震荡';
+    };
+
+    const hRegimeText = (regime, direction) => {
+      if (regime === 'trending') return direction === 'bullish' ? '看涨趋势' : '看跌趋势';
+      if (regime === 'forming') return direction === 'bullish' ? '转涨形成中' : '转跌形成中';
+      if (regime === 'breakout') return direction === 'bullish' ? '突破·看涨' : '突破·看跌';
+      if (regime === 'exhaustion') return direction === 'bullish' ? '多头衰竭' : '空头衰竭';
+      if (regime === 'high_volatility') return '高波动';
+      if (regime === 'low_volatility') return '低波动';
+      return '震荡';
+    };
+
+    const hRegimeClass = (regime, direction) => {
+      if (regime === 'trending') return direction === 'bullish' ? 'up' : 'down';
+      if (regime === 'breakout') return direction === 'bullish' ? 'up' : 'down';
+      if (regime === 'exhaustion') return 'warn';
+      if (regime === 'high_volatility') return 'warn';
+      return '';
+    };
+
+    const verdictRegimeText = computed(() => {
+      if (!data.value?.verdict) return '-';
+      const v = data.value.verdict;
+      const r = v.regime;
+      if (r === 'trending') return v.direction === 'bullish' ? '上涨趋势' : '下跌趋势';
+      if (r === 'forming') return v.direction === 'bullish' ? '上涨趋势形成中' : '下跌趋势形成中';
+      if (r === 'breakout') return v.direction === 'bullish' ? '突破·看涨' : '突破·看跌';
+      if (r === 'exhaustion') return `趋势衰竭（${v.direction === 'bullish' ? '多' : '空'}头减弱）`;
+      if (r === 'high_volatility') return `高波动预警（ATR%=${v.timeframes?.['4h']?.atr_pct?.toFixed(2) || '-'})`;
+      if (r === 'low_volatility') return `低波动蓄力（ATR%=${v.timeframes?.['4h']?.atr_pct?.toFixed(2) || '-'})`;
+      return '震荡行情';
+    });
+
+    const goLogin = () => {
+      if (ws) {
+        ws.onclose = null;
+        ws.close();
+      }
+      location.href = '/';
+    };
+
+    const fmt = p => p ? Number(p).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : '-';
+    const fmtVol = v => { if(!v)return'-'; return v>=1000?(v/1000).toFixed(1)+'K':v.toFixed(2); };
+    const fmtTime = ts => new Date(ts*1000).toLocaleString('zh-CN');
+    const fmtClock = ts => ts ? new Date(ts*1000).toLocaleString('zh-CN', {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false
+    }) : '-';
+
+    const adviceType = computed(() => {
+      const a = data.value?.verdict?.advice;
+      if (!a) return 'wait';
+      if (a.action.includes('做多') || a.action.includes('做空') || a.action.includes('顺势')) return 'trade';
+      if (a.action.includes('减仓') || a.action.includes('离场') || a.action.includes('衰竭')) return 'exit';
+      return 'wait';
+    });
+
+    const overall = computed(() => {
+      if (!data.value || !data.value.verdict) return {text:'-',type:'neutral'};
+      const v = data.value.verdict;
+      return {text: v.summary, type: v.signal};
+    });
+
+    // 趋势历史去重：连续相同的 regime+direction 只保留第一条
+    const dedupedHistory = computed(() => {
+      const history = data.value?.verdict_history || [];
+      const deduped = [];
+      for (const h of history) {
+        if (!deduped.length || deduped[deduped.length - 1].regime !== h.regime || deduped[deduped.length - 1].direction !== h.direction) {
+          deduped.push(h);
+        }
+      }
+      return deduped;
+    });
+
+    // 市场环境上下文
+    const marketContextFundingRateText = computed(() => {
+      const ctx = data.value?.verdict?.market_context;
+      if (!ctx || ctx.funding_rate == null) return '-';
+      // API returns funding_rate already as percentage (raw * 100)
+      return (ctx.funding_rate >= 0 ? '+' : '') + ctx.funding_rate.toFixed(4) + '%';
+    });
+
+    const marketContextFundingRateColor = computed(() => {
+      const ctx = data.value?.verdict?.market_context;
+      if (!ctx || ctx.funding_rate == null) return '#e5e7eb';
+      // API value is already %, 0.0006 = 0.0006%
+      const fr = Math.abs(ctx.funding_rate);
+      if (fr > 0.1) return '#ef4444';
+      if (fr > 0.05) return '#eab308';
+      return '#22c55e';
+    });
+
+    const marketContextOIText = computed(() => {
+      const ctx = data.value?.verdict?.market_context;
+      if (!ctx || ctx.open_interest == null) return '-';
+      const oi = ctx.open_interest;
+      let oiStr;
+      if (oi >= 1e9) oiStr = (oi / 1e9).toFixed(2) + 'B';
+      else if (oi >= 1e6) oiStr = (oi / 1e6).toFixed(2) + 'M';
+      else if (oi >= 1e3) oiStr = (oi / 1e3).toFixed(1) + 'K';
+      else oiStr = oi.toFixed(0);
+
+      // Show OI change rate
+      const prevOi = ctx.open_interest_prev;
+      if (prevOi && prevOi > 0) {
+        const oiChange = ((oi - prevOi) / prevOi * 100).toFixed(3);
+        // Avoid showing -0.00% or +0.000%
+        const absChange = Math.abs(parseFloat(oiChange));
+        if (absChange < 0.0005) {
+          oiStr += ` (0%)`;
+        } else {
+          const sign = parseFloat(oiChange) >= 0 ? '+' : '';
+          oiStr += ` (${sign}${oiChange}%)`;
+        }
+      }
+      return oiStr;
+    });
+
+    const marketContextCircuitBreakerWarning = computed(() => {
+      const ctx = data.value?.verdict?.market_context;
+      if (!ctx || !ctx.circuit_breaker) return '';
+      const cb = ctx.circuit_breaker;
+      if (cb.active) return cb.reason || '电路断路器触发';
+      return '';
+    });
+
+    const marketContextLeverageText = computed(() => {
+      // Suggested leverage from market_context (always present)
+      const mc = data.value?.verdict?.market_context;
+      if (mc && mc.suggested_leverage) return mc.suggested_leverage;
+      // Fallback to order_signal.leverage
+      const os = data.value?.verdict?.order_signal;
+      if (!os || os.leverage == null) return '-';
+      const lev = os.leverage;
+      if (typeof lev === 'string') return lev;
+      return lev + 'x';
+    });
+
+    const marketContextRiskText = computed(() => {
+      // Position sizing risk is in order_signal.position_pct, default 2%
+      const os = data.value?.verdict?.order_signal;
+      if (!os || os.position_pct == null) return '2%';
+      return os.position_pct + '%';
+    });
+
+    const marketContextVolAdjText = computed(() => {
+      const vt = data.value?.verdict?.market_context?.vol_threshold;
+      if (!vt) return '-';
+      return `${vt.adx_trending_adj > 0 ? '+' : ''}${vt.adx_trending_adj.toFixed(1)} → ${vt.effective_trending?.toFixed(1)}`;
+    });
+
+    const marketContextVolAdjColor = computed(() => {
+      const vt = data.value?.verdict?.market_context?.vol_threshold;
+      if (!vt) return '#e5e7eb';
+      if (vt.vol_percentile_4h > 75) return '#f59e0b';  // high vol → amber
+      if (vt.vol_percentile_4h < 25) return '#3b82f6';  // low vol → blue
+      return '#22c55e';  // normal → green
+    });
+
+    // Per-TF threshold helpers for evolution page
+    const tfVolPercent = (tf) => {
+      const t = data.value?.verdict?.timeframes?.[tf];
+      return t?.vol_percentile != null ? t.vol_percentile.toFixed(0) + '%' : '-';
+    };
+
+    const tfBase = (tf, type) => {
+      const ep = data.value?.evolution?.evolution_params;
+      const tfCfg = ep?.tf_thresholds?.[tf];
+      if (!tfCfg) return '-';
+      const key = type === 'trending' ? 'adx_trending_threshold' : 'adx_forming_threshold';
+      return tfCfg[key]?.toFixed(1) || '-';
+    };
+
+    const tfEff = (tf, type) => {
+      const t = data.value?.verdict?.timeframes?.[tf];
+      if (!t) return '-';
+      const key = type === 'trending' ? 'effective_trending' : 'effective_forming';
+      return t[key]?.toFixed(1) || '-';
+    };
+
+    // Overload: volAdjColor can take (tfName, type) to color effective vs base diff
+    const volAdjColor = (arg1, arg2) => {
+      // If two args, it's (tfName, type) — check if vol adjustment is + or -
+      if (arg2 !== undefined) {
+        const t = data.value?.verdict?.timeframes?.[arg1];
+        if (!t) return '#e5e7eb';
+        const adjKey = arg2 === 'trending' ? 'trending_adj' : 'forming_adj';
+        const adj = t[adjKey] || 0;
+        if (adj > 0.5) return '#f59e0b';   // vol raised threshold → amber
+        if (adj < -0.5) return '#3b82f6';   // vol lowered threshold → blue
+        return '#22c55e';                    // minimal change → green
+      }
+      // Single arg: original volPct usage
+      const volPct = arg1;
+      if (volPct == null) return '#e5e7eb';
+      if (volPct > 75) return '#f59e0b';
+      if (volPct < 25) return '#3b82f6';
+      return '#22c55e';
+    };
+
+    const evoTf = (tf) => {
+      if(!data.value||!data.value.evolution) return null;
+      return data.value.evolution.timeframes[tf] || null;
+    };
+
+    const accClass = (acc) => {
+      if(acc===null||acc===undefined) return 'acc-none';
+      if(acc>=60) return 'acc-good';
+      if(acc>=50) return 'acc-ok';
+      return 'acc-bad';
+    };
+
+    const weightColor = (acc) => {
+      if(acc===null||acc===undefined) return '#374151';
+      if(acc>=60) return '#22c55e';
+      if(acc>=50) return '#eab308';
+      return '#ef4444';
+    };
+
+    const connectWs = () => {
+      // 每 10 秒轮询刷新，不使用 WebSocket
+      setInterval(async () => {
+        try {
+          await fetchSignals();
+          await loadSimPosition();
+          await loadSimHistory();
+          await loadSimStats();
+        } catch(e) { console.error(e); }
+      }, 10000);
+    };
+
+    const fetchSignals = async () => {
+      const resp = await fetch('/api/signals');
+      if (resp.status === 401) {
+        goLogin();
+        return;
+      }
+      data.value = await resp.json();
+      // Sync simulated position from signals response
+      if (data.value.simulated_position) {
+        simPosition.value = data.value.simulated_position;
+      } else if (simPosition.value) {
+        // If no open sim position in response, clear it
+        simPosition.value = null;
+      }
+      updateTime.value = new Date().toLocaleTimeString('zh-CN');
+    };
+
+    const logout = async () => {
+      try {
+        await fetch('/logout', { method: 'POST' });
+      } finally {
+        goLogin();
+      }
+    };
+
+    onMounted(async () => {
+      try {
+        await fetchSignals();
+        await loadSimPosition();
+        await loadSimHistory();
+        await loadSimStats();
+      } catch(e) { console.error(e); }
+      connectWs();
+    });
+
+    onUnmounted(() => { if(ws) ws.close(); });
+
+    return { data, tab, updateTime, sigText, fmt, fmtVol, fmtTime, fmtClock, overall, adviceType, evoTf, accClass, weightColor, logout,
+             verdictRegimeText, tfRegimeText, hRegimeText, hRegimeClass,
+             dedupedHistory,
+             simPosition, simHistory, simPage, simPageSize, simTotalPages, simTotal, simPagePrev, simPageNext, simPageTo, simStats, simPositionSize, simNotionalValue, simPnl, simHoldTime, simActionStateText, simCloseReasonText, histActionLabel, histActionColor, histPrice, histPositionSize, histMargin, histDetail, histStatus, simHistSize, simHistMargin, simStopDist, simStopDistColor,
+             marketContextFundingRateText, marketContextFundingRateColor, marketContextOIText, marketContextCircuitBreakerWarning, marketContextLeverageText, marketContextRiskText, marketContextVolAdjText, marketContextVolAdjColor, volAdjColor, tfVolPercent, tfBase, tfEff };
+  }
+}).mount('#app');
+</script>
+{% endraw %}
+</body>
+</html>

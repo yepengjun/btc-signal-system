@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 | BTC 合约交易信号</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background:
+    radial-gradient(circle at top left, rgba(247,147,26,0.16), transparent 32%),
+    radial-gradient(circle at bottom right, rgba(34,197,94,0.12), transparent 28%),
+    #0a0e17;
+  color: #e5e7eb;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+.panel {
+  width: 100%;
+  max-width: 420px;
+  background: rgba(17,24,39,0.96);
+  border: 1px solid #1f2937;
+  border-radius: 18px;
+  padding: 28px;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.45);
+}
+.eyebrow {
+  color: #f7931a;
+  font-size: 12px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+h1 {
+  font-size: 28px;
+  line-height: 1.2;
+  margin-bottom: 10px;
+}
+.subtitle {
+  color: #9ca3af;
+  font-size: 14px;
+  line-height: 1.7;
+  margin-bottom: 22px;
+}
+.field { margin-bottom: 14px; }
+.field label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+  color: #cbd5e1;
+}
+.field input {
+  width: 100%;
+  background: #0d1220;
+  color: #f9fafb;
+  border: 1px solid #243044;
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 15px;
+  outline: none;
+}
+.field input:focus {
+  border-color: #f7931a;
+  box-shadow: 0 0 0 3px rgba(247,147,26,0.12);
+}
+.actions { margin-top: 20px; }
+button {
+  width: 100%;
+  border: none;
+  border-radius: 10px;
+  padding: 12px 16px;
+  background: linear-gradient(135deg, #f7931a, #ffb454);
+  color: #111827;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.65; cursor: wait; }
+.error {
+  min-height: 20px;
+  margin-top: 12px;
+  color: #f87171;
+  font-size: 13px;
+}
+.hint {
+  margin-top: 18px;
+  color: #6b7280;
+  font-size: 12px;
+  line-height: 1.6;
+}
+</style>
+</head>
+<body>
+  <div class="panel">
+    <div class="eyebrow">Trad2</div>
+    <h1>用户登录</h1>
+    <p class="subtitle">登录后才能查看 BTC 合约交易信号、自进化统计与实时推送数据。</p>
+    <form id="login-form">
+      <div class="field">
+        <label for="username">用户名</label>
+        <input id="username" name="username" type="text" autocomplete="username" required>
+      </div>
+      <div class="field">
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+      </div>
+      <div class="actions">
+        <button id="submit-btn" type="submit">登录</button>
+      </div>
+      <div id="error" class="error"></div>
+    </form>
+    <div class="hint">未登录时，接口和 WebSocket 连接会返回未授权。</div>
+  </div>
+  <script>
+    const form = document.getElementById('login-form');
+    const button = document.getElementById('submit-btn');
+    const error = document.getElementById('error');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      error.textContent = '';
+      button.disabled = true;
+      const payload = { username: form.username.value.trim(), password: form.password.value };
+      try {
+        const resp = await fetch('/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        if (!resp.ok) {
+          const data = await resp.json().catch(() => ({ detail: '登录失败' }));
+          throw new Error(data.detail || '登录失败');
+        }
+        location.href = '/';
+      } catch (err) {
+        error.textContent = err.message || '登录失败';
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

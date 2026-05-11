@@ -1,0 +1,41 @@
+{
+  "adx_trending_threshold": 25,
+  "adx_forming_threshold": 20,
+  "adx_exit_threshold": 20,
+  "di_crossover_window": 2,
+  "adx_drop_reduce": 5,
+  "di_diff_reduce": 5,
+  "price_divergence_threshold": 5,
+  "momentum_accel_threshold": 3,
+  "confidence_base": 50,
+  "min_di_spread": 3,
+  "vol_adjustment_factor": 0.1,
+  "atr_stop_multiplier": 2.2,
+  "rr_ratio": 1.5,
+  "last_updated": 1778535615.731508,
+  "tf_thresholds": {
+    "30m": {
+      "adx_trending_threshold": 20,
+      "adx_forming_threshold": 15,
+      "consecutive_wrong_regime": 0,
+      "unreliable": false
+    },
+    "1h": {
+      "adx_trending_threshold": 33,
+      "adx_forming_threshold": 17,
+      "consecutive_wrong_regime": 0,
+      "unreliable": false
+    },
+    "4h": {
+      "adx_trending_threshold": 25,
+      "adx_forming_threshold": 20,
+      "consecutive_wrong_regime": 0,
+      "unreliable": false
+    }
+  },
+  "last_verified_counts": {
+    "30m": 22,
+    "1h": 8,
+    "4h": 3
+  }
+}

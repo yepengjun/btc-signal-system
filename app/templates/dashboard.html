@@ -1345,7 +1345,7 @@ createApp({
     // ── 模拟仓位加载 ──
     const loadSimPosition = async () => {
       try {
-        const resp = await fetch('/api/position/simulated');
+        const resp = await fetch('./api/position/simulated');
         if (resp.ok) {
           simPosition.value = await resp.json();
         }
@@ -1370,7 +1370,7 @@ createApp({
 
     const loadSimStats = async () => {
       try {
-        const resp = await fetch('/api/position/simulated/stats');
+        const resp = await fetch('./api/position/simulated/stats');
         if (resp.ok) {
           simStats.value = await resp.json();
         }
@@ -1588,7 +1588,7 @@ createApp({
         ws.onclose = null;
         ws.close();
       }
-      location.href = '/';
+      location.href = './';
     };
 
     const fmt = p => p ? Number(p).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : '-';
@@ -1787,7 +1787,7 @@ createApp({
     };
 
     const fetchSignals = async () => {
-      const resp = await fetch('/api/signals');
+      const resp = await fetch('./api/signals');
       if (resp.status === 401) {
         goLogin();
         return;
@@ -1805,7 +1805,7 @@ createApp({
 
     const logout = async () => {
       try {
-        await fetch('/logout', { method: 'POST' });
+        await fetch('./logout', { method: 'POST' });
       } finally {
         goLogin();
       }

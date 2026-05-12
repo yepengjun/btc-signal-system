@@ -125,12 +125,12 @@ button:disabled { opacity: 0.65; cursor: wait; }
       button.disabled = true;
       const payload = { username: form.username.value.trim(), password: form.password.value };
       try {
-        const resp = await fetch('/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        const resp = await fetch('./login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         if (!resp.ok) {
           const data = await resp.json().catch(() => ({ detail: '登录失败' }));
           throw new Error(data.detail || '登录失败');
         }
-        location.href = '/';
+        location.href = './';
       } catch (err) {
         error.textContent = err.message || '登录失败';
       } finally {

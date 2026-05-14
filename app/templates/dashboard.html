@@ -814,6 +814,24 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
         <div v-if="marketContextCircuitBreakerWarning" style="margin-top:12px;padding:10px 14px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;font-size:13px;color:#f87171;display:flex;align-items:center;gap:8px">
           &#9888; {{ marketContextCircuitBreakerWarning }}
         </div>
+        <!-- DI 收敛预警 -->
+        <div v-if="marketContextConvergenceWarning" style="margin-top:12px;padding:10px 14px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.3);border-radius:8px;font-size:13px;color:#fbbf24;display:flex;align-items:center;gap:8px">
+          &#9888; DI收敛预警（{{ marketContextConvergenceDirection }}）— {{ marketContextConvergenceReason }}
+        </div>
+        <!-- 两阶段信号：Stage 1 预警 -->
+        <div v-if="stage1Warning" style="margin-top:12px;padding:12px 16px;background:rgba(168,85,247,0.1);border:1px solid rgba(168,85,247,0.35);border-radius:10px">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+            <span style="font-size:14px;font-weight:700;color:#c084fc">&#9889; Stage 1 预警</span>
+            <span style="font-size:12px;padding:2px 8px;border-radius:4px;background:rgba(168,85,247,0.2);color:#e9d5ff">{{ stage1WarningTypeLabel }}</span>
+            <span style="font-size:12px;padding:2px 8px;border-radius:4px;background:rgba(168,85,247,0.2);color:#e9d5ff">{{ stage1WarningDirection }}</span>
+          </div>
+          <div style="font-size:13px;color:#d8b4fe;line-height:1.6">{{ stage1WarningReason }}</div>
+          <div style="margin-top:6px;font-size:11px;color:#a78bfa">建议仓位: {{ stage1WarningPositionHint }}% | 信心: {{ stage1WarningConfidence }} — 轻仓试探，等待4h确认后加仓</div>
+        </div>
+        <!-- 盘整突破轻仓试单 -->
+        <div v-if="marketContextRangingBreakout" style="margin-top:12px;padding:10px 14px;background:rgba(168,85,247,0.08);border:1px solid rgba(168,85,247,0.3);border-radius:8px;font-size:13px;color:#c084fc;display:flex;align-items:center;gap:8px">
+          &#128640; 盘整突破信号（{{ marketContextRangingBreakoutDirection }}）— {{ marketContextRangingBreakoutReason }}
+        </div>
         <!-- 多时间框架对齐规则 -->
         <div v-if="data.verdict.market_context.alignment_rule" style="margin-top:12px;padding:10px 14px;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.3);border-radius:8px;font-size:13px;color:#93c5fd">
           &#128270; {{ data.verdict.market_context.alignment_rule }}
@@ -1313,6 +1331,52 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
           </div>
         </div>
       </div>
+
+      <!-- ═══ Stage 1 信号统计 ═══ -->
+      <div class="evo-section">
+        <h3>Stage 1 预警统计</h3>
+        <!-- 有数据时显示表格 -->
+        <div v-if="data.evolution.stage1_stats && Object.keys(data.evolution.stage1_stats).length > 0" style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;font-size:12px">
+            <thead>
+              <tr style="border-bottom:1px solid #1f2937;color:#6b7280">
+                <th style="padding:8px;text-align:left">信号类型</th>
+                <th style="padding:8px;text-align:center">样本</th>
+                <th style="padding:8px;text-align:center">方向正确</th>
+                <th style="padding:8px;text-align:center">趋势正确</th>
+                <th style="padding:8px;text-align:center">TP命中</th>
+                <th style="padding:8px;text-align:center">SL命中</th>
+                <th style="padding:8px;text-align:center">平均MFE</th>
+                <th style="padding:8px;text-align:center">平均MAE</th>
+                <th style="padding:8px;text-align:center">转Stage2</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="s in data.evolution.stage1_stats" :key="s.type+'_'+s.timeframe"
+                  style="border-bottom:1px solid rgba(31,41,55,0.5)">
+                <td style="padding:8px">
+                  <span style="color:#c084fc;font-weight:600">{{ s.type }}</span>
+                  <span style="color:#6b7280;margin-left:4px">({{ {'30m':'30分钟','1h':'1小时','4h':'4小时'}[s.timeframe] || s.timeframe }})</span>
+                </td>
+                <td style="padding:8px;text-align:center;color:#e5e7eb">{{ s.samples }}</td>
+                <td style="padding:8px;text-align:center" :class="s.direction_correct_pct>=55?'up':s.direction_correct_pct<40?'down':''">{{ s.direction_correct_pct }}%</td>
+                <td style="padding:8px;text-align:center" :class="s.regime_correct_pct>=70?'up':s.regime_correct_pct<45?'down':''">{{ s.regime_correct_pct }}%</td>
+                <td style="padding:8px;text-align:center;color:#22c55e">{{ s.tp_hit_pct }}%</td>
+                <td style="padding:8px;text-align:center;color:#ef4444">{{ s.sl_hit_pct }}%</td>
+                <td style="padding:8px;text-align:center;color:#22c55e">{{ s.avg_mfe.toFixed(1) }}%</td>
+                <td style="padding:8px;text-align:center;color:#ef4444">{{ s.avg_mae.toFixed(1) }}%</td>
+                <td style="padding:8px;text-align:center" :class="s.stage2_upgrade_pct>=25?'up':''">{{ s.stage2_upgrade_pct }}%</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <!-- 暂无数据提示 -->
+        <div v-else
+             style="font-size:13px;color:#6b7280;padding:16px;text-align:center;background:#0d1220;border-radius:8px;border:1px solid #1f2937">
+          <div style="margin-bottom:4px">暂无 Stage 1 数据</div>
+          <div style="font-size:11px">需要积累至少 30 个样本（每种类型）后开始分析，请等待信号验证</div>
+        </div>
+      </div>
     </template>
   </div>
 
@@ -1681,6 +1745,77 @@ createApp({
       return '';
     });
 
+    const marketContextConvergenceWarning = computed(() => {
+      const ctx = data.value?.verdict?.market_context;
+      if (!ctx || !ctx.convergence_warning) return false;
+      return ctx.convergence_warning.detected;
+    });
+
+    const marketContextConvergenceDirection = computed(() => {
+      const ctx = data.value?.verdict?.market_context;
+      if (!ctx?.convergence_warning?.detected) return '';
+      return ctx.convergence_warning.old_direction === 'bearish' ? '看跌减弱' : '看涨减弱';
+    });
+
+    const marketContextConvergenceReason = computed(() => {
+      const ctx = data.value?.verdict?.market_context;
+      if (!ctx?.convergence_warning?.detected) return '';
+      return ctx.convergence_warning.reason || '';
+    });
+
+    const marketContextRangingBreakout = computed(() => {
+      const ctx = data.value?.verdict?.market_context;
+      if (!ctx || !ctx.ranging_breakout) return false;
+      return !!ctx.ranging_breakout.direction;
+    });
+
+    const marketContextRangingBreakoutDirection = computed(() => {
+      const ctx = data.value?.verdict?.market_context;
+      const rb = ctx?.ranging_breakout;
+      if (!rb || !rb.direction) return '';
+      return rb.direction === 'bullish' ? '看涨' : '看跌';
+    });
+
+    const marketContextRangingBreakoutReason = computed(() => {
+      const ctx = data.value?.verdict?.market_context;
+      const rb = ctx?.ranging_breakout;
+      if (!rb || !rb.direction) return '';
+      return rb.reason || '';
+    });
+
+    // ─── Two-Stage Signal: Stage 1 Warning ───
+    const stage1Warning = computed(() => {
+      const ctx = data.value?.verdict?.market_context;
+      return ctx?.stage_1_warning || null;
+    });
+
+    const stage1WarningTypeLabel = computed(() => {
+      const s = stage1Warning.value;
+      if (!s) return '';
+      const labels = { convergence_breakout: '收敛突破', trend_startup: '趋势启动', ranging_breakout: '盘整突破' };
+      return labels[s.type] || s.type;
+    });
+
+    const stage1WarningDirection = computed(() => {
+      const s = stage1Warning.value;
+      return s?.direction_label || '';
+    });
+
+    const stage1WarningReason = computed(() => {
+      const s = stage1Warning.value;
+      return s?.reason || '';
+    });
+
+    const stage1WarningPositionHint = computed(() => {
+      const s = stage1Warning.value;
+      return s?.position_pct_hint || 10;
+    });
+
+    const stage1WarningConfidence = computed(() => {
+      const s = stage1Warning.value;
+      return s?.confidence ? `${s.confidence}` : '-';
+    });
+
     const marketContextLeverageText = computed(() => {
       // Suggested leverage from market_context (always present)
       const mc = data.value?.verdict?.market_context;
@@ -1827,7 +1962,7 @@ createApp({
              verdictRegimeText, tfRegimeText, hRegimeText, hRegimeClass,
              dedupedHistory,
              simPosition, simHistory, simPage, simPageSize, simTotalPages, simTotal, simPagePrev, simPageNext, simPageTo, simStats, simPositionSize, simNotionalValue, simPnl, simHoldTime, simActionStateText, simCloseReasonText, histActionLabel, histActionColor, histPrice, histPositionSize, histMargin, histDetail, histStatus, simHistSize, simHistMargin, simStopDist, simStopDistColor,
-             marketContextFundingRateText, marketContextFundingRateColor, marketContextOIText, marketContextCircuitBreakerWarning, marketContextLeverageText, marketContextRiskText, marketContextVolAdjText, marketContextVolAdjColor, volAdjColor, tfVolPercent, tfBase, tfEff };
+             marketContextFundingRateText, marketContextFundingRateColor, marketContextOIText, marketContextCircuitBreakerWarning, marketContextConvergenceWarning, marketContextConvergenceDirection, marketContextConvergenceReason, marketContextRangingBreakout, marketContextRangingBreakoutDirection, marketContextRangingBreakoutReason, stage1Warning, stage1WarningTypeLabel, stage1WarningDirection, stage1WarningReason, stage1WarningPositionHint, stage1WarningConfidence, marketContextLeverageText, marketContextRiskText, marketContextVolAdjText, marketContextVolAdjColor, volAdjColor, tfVolPercent, tfBase, tfEff };
   }
 }).mount('#app');
 </script>

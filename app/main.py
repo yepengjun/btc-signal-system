@@ -14,10 +14,10 @@ from app.config import settings
 from app.database import init_db, get_connection
 from app.auth import create_session, verify_session, authenticate
 from app.signal_engine import generate_verdict
-from app.binance import fetch_klines, fetch_price, fetch_funding_rate, fetch_open_interest
+from app.binance import fetch_klines, fetch_price, fetch_funding_rate, fetch_open_interest, fetch_all_market_data
 from app.evolution import get_evolution_stats, verify_pending_signals, get_active_thresholds
 from app.hyperliquid import place_order as hl_place_order, close_position as hl_close_position
-from app.simulated_position_manager import manage_simulated_position, _check_price_based_exit
+from app.simulated_position_manager import manage_simulated_position, _check_price_based_exit, _register_auto_hooks
 
 app = FastAPI()
 templates = Jinja2Templates(directory="app/templates")
@@ -110,6 +110,10 @@ async def startup():
         except Exception:
             pass  # 预热失败不影响正常启动
     threading.Thread(target=_warm_cache, daemon=True).start()
+
+    # Register auto-trader callbacks (mirrors simulated positions to Hyperliquid)
+    from app.auto_trader import register_callbacks
+    register_callbacks()
 
     # 后台监控模拟仓位，独立于信号缓存（每 10 秒检查一次止盈/止损）
     def _monitor_sim_positions():
@@ -323,22 +327,95 @@ def _build_signals_response(now: float = None, force_refresh: bool = False) -> d
     if now is None:
         now = time.time()
 
-    # Fetch external market data for filtering
-    funding_rate = fetch_funding_rate(settings.binance_symbol)
-    current_oi, prev_oi = fetch_open_interest(settings.binance_symbol)
+    # Fetch all market data in parallel (klines + funding + OI)
+    # Use different limits per TF — vol_percentile needs ~5-7 days of data
+    market_data = fetch_all_market_data(
+        settings.binance_symbol,
+        timeframes=["30m", "1h", "4h"],
+        limits={"30m": 200, "1h": 200, "4h": 100},
+    )
+    funding_rate = market_data.get("funding_rate", 0.0)
+    current_oi = market_data.get("open_interest", 0.0)
+    prev_oi = market_data.get("open_interest_prev", 0.0)
 
     # Recent price history for OI divergence detection
-    price_candles = fetch_klines(settings.binance_symbol, "4h", limit=6)
+    price_candles = market_data.get("klines_4h", [])[:6]
     price_history = [c["close"] for c in price_candles] if price_candles else []
+
+    # Exhaustion reversal cooling: check if a reversal signal was recently emitted
+    last_reversal_row = conn.execute(
+        "SELECT created_at, direction FROM signals "
+        "WHERE signal_type = 'exhaustion_reversal' ORDER BY created_at DESC LIMIT 3"
+    ).fetchall()
+    recent_reversals = [
+        {"created_at": r["created_at"], "direction": r["direction"]} for r in last_reversal_row
+    ]
+
+    # P3 ranging breakout / macro bias cooldown: track recent signals
+    last_p3_row = conn.execute(
+        "SELECT created_at, direction, signal_type FROM signals "
+        "WHERE signal_type IN ('ranging_breakout', 'macro_bias_long') "
+        "ORDER BY created_at DESC LIMIT 5"
+    ).fetchall()
+    recent_p3_signals = [
+        {"created_at": r["created_at"], "direction": r["direction"], "signal_type": r["signal_type"]}
+        for r in last_p3_row
+    ]
+
+    # Aggressive signal cooldowns: track recent aggressive signal timestamps
+    from app.signal_engine import AGGRESSIVE_COOLDOWNS
+    last_agg_row = conn.execute(
+        "SELECT created_at, signal_type FROM signals "
+        "WHERE signal_type LIKE 'aggressive_%' OR signal_type IN ('double_top', 'double_bottom') "
+        "ORDER BY created_at DESC LIMIT 20"
+    ).fetchall()
+    now_ts = time.time()
+    aggressive_cooldowns = {}
+    for r in last_agg_row:
+        stype = r["signal_type"]
+        if stype in AGGRESSIVE_COOLDOWNS:
+            elapsed = now_ts - r["created_at"]
+            if elapsed < AGGRESSIVE_COOLDOWNS[stype]:
+                aggressive_cooldowns[stype] = True
+
+    # Track last active aggressive signal (for sticky persistence):
+    # double_top/double_bottom are persistent patterns; volume_spike is transient.
+    last_aggressive = None
+    for r in last_agg_row:
+        stype = r["signal_type"]
+        if stype in ("double_top", "double_bottom"):
+            agg_key = "aggressive_pattern_breakout"
+        elif stype.startswith("aggressive_"):
+            agg_key = stype
+        else:
+            continue
+        elapsed = now_ts - r["created_at"]
+        if elapsed < AGGRESSIVE_COOLDOWNS.get(agg_key, 7200):
+            is_persistent = agg_key in ("aggressive_pattern_breakout", "aggressive_squeeze_breakout")
+            last_aggressive = f"{agg_key},{is_persistent}"
+            break
 
     market_ctx = {
         "funding_rate": funding_rate,
         "open_interest": current_oi,
         "open_interest_prev": prev_oi,
         "price_history": price_history,
+        "recent_reversals": recent_reversals,
+        "recent_p3_signals": recent_p3_signals,
+        "aggressive_cooldowns": aggressive_cooldowns,
+        "last_aggressive_signal": last_aggressive,
     }
 
-    data = generate_verdict(history_rows=history_rows, position=position_dict, market_context=market_ctx)
+    data = generate_verdict(
+        history_rows=history_rows,
+        position=position_dict,
+        market_context=market_ctx,
+        pre_fetched_klines={
+            "30m": market_data.get("klines_30m", []),
+            "1h": market_data.get("klines_1h", []),
+            "4h": market_data.get("klines_4h", []),
+        },
+    )
     latest_signals = {}
     for tf in data["timeframes"]:
         row = conn.execute(
@@ -350,16 +427,27 @@ def _build_signals_response(now: float = None, force_refresh: bool = False) -> d
             latest_signals[tf] = (row["regime"], row["direction"], row["verdict"], row["action"])
 
     signal_changed = False
+    # Per-TF candle cooldown: prevent duplicate signals within same candle window.
+    CANDLE_SECONDS = {"30m": 1800, "1h": 3600, "4h": 14400}
     for tf, tf_data in data["timeframes"].items():
         prev = latest_signals.get(tf)
         new_sig = (tf_data["regime"], tf_data["direction"], data["verdict"]["direction"], data["verdict"]["advice"]["action"])
         if prev is None or prev != new_sig:
+            # Check if a signal was already created in the current candle period
+            tf_seconds = CANDLE_SECONDS.get(tf, 3600)
+            candle_start = now - (now % tf_seconds)
+            existing = conn.execute(
+                "SELECT id FROM signals WHERE timeframe = ? AND created_at >= ? LIMIT 1",
+                (tf, candle_start),
+            ).fetchone()
+            if existing:
+                continue  # Skip: already have a signal for this candle
             signal_changed = True
             conn.execute(
                 "INSERT INTO signals (timeframe, regime, direction, adx, plus_di, minus_di, "
                 "confidence, strength, momentum, duration_hours, price_at_signal, "
-                "verdict, action, target, stop, created_at, verified) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                "verdict, action, target, stop, signal_type, created_at, verified) VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                 (
                     tf, tf_data["regime"], tf_data["direction"], tf_data["adx"],
                     tf_data["plus_di"], tf_data["minus_di"], tf_data["confidence"],
@@ -369,6 +457,7 @@ def _build_signals_response(now: float = None, force_refresh: bool = False) -> d
                     data["verdict"]["advice"]["action"],
                     data["verdict"]["advice"]["target"],
                     data["verdict"]["advice"]["stop"],
+                    tf_data.get("signal_type", "trend_following"),
                     now,
                 ),
             )
@@ -567,92 +656,72 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
         return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
     conn = get_connection()
 
-    # Flat timeline: every action (open, add, reduce, close) as one row, sorted by time DESC
     offset = (page - 1) * page_size
 
-    # Also count total: action entries + closed position close events
-    action_count = conn.execute("""
-        SELECT COUNT(*) FROM position_action_state a
-        JOIN positions p ON a.position_id = p.id
-        WHERE p.is_simulated = 1
-    """).fetchone()[0]
-    closed_count = conn.execute("""
+    # Each open position = 1 row (open). Each closed position = 2 rows (open + close).
+    total = conn.execute("""
         SELECT COUNT(*) FROM positions
+        WHERE is_simulated = 1 AND status = 'open'
+    """).fetchone()[0] + conn.execute("""
+        SELECT COUNT(*) * 2 FROM positions
         WHERE is_simulated = 1 AND status = 'closed'
     """).fetchone()[0]
-    total = action_count + closed_count
 
-    # 1. Collect all open/add/reduce from position_action_state
-    actions = conn.execute("""
-        SELECT
-            a.id as action_id,
-            a.position_id,
-            a.action,
-            a.adx_4h,
-            a.price,
-            a.position_size,
-            a.created_at,
-            p.side,
-            p.entry_price,
-            p.leverage,
-            p.pnl,
-            p.close_price,
-            p.close_reason,
-            p.entry_reason,
-            p.status,
-            p.closed_at,
-            p.reduce_count,
-            p.realized_pnl
-        FROM position_action_state a
-        JOIN positions p ON a.position_id = p.id
-        WHERE p.is_simulated = 1
-        ORDER BY a.created_at DESC
-        LIMIT ? OFFSET ?
-    """, (page_size, offset)).fetchall()
-
-    # Get pnl from closed positions (close events) — each closed position adds a 'close' row
-    closed = conn.execute("""
-        SELECT id, side, entry_price, leverage, position_size, pnl,
-               close_price, close_reason, entry_reason, closed_at, realized_pnl, created_at
+    # Fetch open positions first
+    open_rows = conn.execute("""
+        SELECT id, side, entry_price, close_price, close_reason, entry_reason,
+               leverage, position_size, pnl, realized_pnl, created_at, closed_at,
+               reduce_count, add_count, status
         FROM positions
-        WHERE is_simulated = 1 AND status = 'closed'
+        WHERE is_simulated = 1 AND status = 'open'
+        ORDER BY created_at DESC
     """).fetchall()
 
-    # Merge action rows + close rows, then sort by time DESC
-    records = []
-    for a in actions:
-        row = dict(a)
-        row["action_type"] = "action"  # open/add/reduce
-        records.append(row)
+    # Fetch closed positions
+    closed_rows = conn.execute("""
+        SELECT id, side, entry_price, close_price, close_reason, entry_reason,
+               leverage, position_size, pnl, realized_pnl, created_at, closed_at,
+               reduce_count, add_count, status
+        FROM positions
+        WHERE is_simulated = 1 AND status = 'closed'
+        ORDER BY closed_at DESC
+    """).fetchall()
 
-    for c in closed:
-        records.append({
-            "action_id": None,
-            "position_id": c["id"],
-            "action": "close",
-            "adx_4h": None,
-            "price": c["close_price"],
-            "created_at": c["closed_at"],
-            "side": c["side"],
-            "entry_price": c["entry_price"],
-            "leverage": c["leverage"],
-            "position_size": c["position_size"],
-            "pnl": c["pnl"],
-            "close_price": c["close_price"],
-            "close_reason": c["close_reason"],
-            "entry_reason": c["entry_reason"],
-            "status": "closed",
-            "closed_at": c["closed_at"],
-            "reduce_count": None,
-            "realized_pnl": c["realized_pnl"],
-            "action_type": "close",
-        })
+    # Build rows: for each closed position produce open+close, for open produce only open
+    all_records = []
+    for r in open_rows:
+        rd = dict(r)
+        rd["action_id"] = None
+        rd["action"] = "open"
+        rd["action_type"] = "open"
+        rd["price"] = rd["entry_price"]
+        rd["duration_hours"] = None
+        all_records.append(rd)
 
-    # Sort all records by created_at DESC
-    records.sort(key=lambda x: x["created_at"] or 0, reverse=True)
+    for r in closed_rows:
+        rd = dict(r)
+        rd["duration_hours"] = round((rd["closed_at"] - rd["created_at"]) / 3600, 1) if rd.get("closed_at") and rd.get("created_at") else None
 
+        # Open row
+        open_rec = dict(rd)
+        open_rec["action"] = "open"
+        open_rec["action_type"] = "open"
+        open_rec["price"] = open_rec["entry_price"]
+        all_records.append(open_rec)
+
+        # Close row
+        close_rec = dict(rd)
+        close_rec["action"] = "close"
+        close_rec["action_type"] = "close"
+        close_rec["price"] = close_rec.get("close_price") or close_rec["entry_price"]
+        close_rec["created_at"] = close_rec["closed_at"]  # show close time in UI
+        all_records.append(close_rec)
+
+    # Sort by: open positions first (status=open), then closed by created_at desc
+    # Already ordered by SQL, just keep the order: open first, then closed pairs
     # Apply pagination
-    records = records[offset:offset + page_size]
+    total_pages = (total + page_size - 1) // page_size if page_size > 0 else 0
+    records = all_records[offset:offset + page_size]
 
     conn.close()
 

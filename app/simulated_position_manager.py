@@ -28,6 +28,23 @@ import time
 from app.config import settings
 from app.evolution import get_active_thresholds
 
+# Hook registries for auto-trader callbacks
+# Each hook: fn(conn, position_dict, ...) — set by auto_trader.register_callbacks()
+_auto_open_hooks = []
+_auto_close_hooks = []
+_auto_reduce_hooks = []
+_auto_add_hooks = []
+
+
+def _register_auto_hooks(open_hooks, close_hooks, reduce_hooks, add_hooks):
+    """Internal: called by auto_trader.register_callbacks()."""
+    global _auto_open_hooks, _auto_close_hooks, _auto_reduce_hooks, _auto_add_hooks
+    _auto_open_hooks = open_hooks or []
+    _auto_close_hooks = close_hooks or []
+    _auto_reduce_hooks = reduce_hooks or []
+    _auto_add_hooks = add_hooks or []
+
+
 SIGNAL_COOLDOWN_SECONDS = 2 * settings.signal_interval_seconds  # opposite direction cooldown
 MAX_REDUCE_COUNT = 2
 MAX_ADD_COUNT = 3  # max pyramid adds
@@ -60,6 +77,13 @@ def close_simulated_position(conn, position: dict, close_price: float, reason: s
         (round(pnl, 2), reason, round(close_price, 1), now, now, position["id"]),
     )
     conn.commit()
+
+    # Fire close hooks (auto-trader mirror)
+    for hook in _auto_close_hooks:
+        try:
+            hook(conn, position, close_price, reason)
+        except Exception:
+            pass  # hook failure must not break position management
 
 
 def _update_trailing_stop(conn, position: dict):
@@ -139,6 +163,30 @@ def _check_signal_reversal(conn, sim_pos: dict, verdict: dict, current_price: fl
         if opposite:
             close_simulated_position(conn, sim_pos, current_price, "signal_reversal_exhaustion")
             return True
+
+    return False
+
+
+def _check_trend_exhaustion(conn, sim_pos: dict, verdict: dict, current_price: float) -> bool:
+    """Reduce position when verdict detects trend exhaustion matching position side.
+
+    Acts as an early warning — fires even when regime != "exhaustion",
+    catching ADX ceiling, DI convergence, and price structure reversal.
+    """
+    market_ctx = verdict.get("market_context", {})
+    exhausted = market_ctx.get("trend_exhausted", {})
+    if not exhausted.get("detected"):
+        return False
+
+    exhausted_dir = exhausted.get("direction")
+    pos_side = sim_pos.get("side")
+
+    # Same direction exhaustion = time to exit
+    if (pos_side == "short" and exhausted_dir == "bearish") or \
+       (pos_side == "long" and exhausted_dir == "bullish"):
+        reason = exhausted.get("reason", "趋势末端，动能衰竭")
+        close_simulated_position(conn, sim_pos, current_price, f"trend_exhaustion: {reason}")
+        return True
 
     return False
 
@@ -246,6 +294,14 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
             (sim_pos["id"], f"reduce_{new_reduce_count}", adx_4h, round(current_price, 1), round(reduce_size, 6), now),
         )
         conn.commit()
+
+        # Fire reduce hooks
+        for hook in _auto_reduce_hooks:
+            try:
+                hook(conn, sim_pos, reduce_size)
+            except Exception:
+                pass
+
         return
 
     # Add signals - pyramid add-on (priority 7)
@@ -309,6 +365,14 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
             (position_id, new_action_state, adx_4h, round(current_price, 1), round(add_btc, 6), now),
         )
         conn.commit()
+
+        # Fire add hooks
+        for hook in _auto_add_hooks:
+            try:
+                hook(conn, sim_pos, add_btc)
+            except Exception:
+                pass
+
         return
 
     # Hold - just update max_adx
@@ -383,22 +447,41 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
     target = order.get("target")
     stop = order.get("stop")
     entry_adx = verdict.get("timeframes", {}).get("4h", {}).get("adx")
+    signal_type = verdict.get("timeframes", {}).get("4h", {}).get("signal_type", "")
 
-    # Verify risk:reward ratio (minimum from evolution params)
+    # Verify risk:reward ratio — dynamic by signal type.
+    # Trend signals (4h trending + aligned) use evolution rr_ratio (default 1.5).
+    # All other signals (aggressive/stage1/macro/ranging etc.) use 0.5 floor —
+    # position sizing already scales with RR (base_pct = 2.0/max(rr,1)).
     if target and stop:
-        risk = abs(current_price - stop)
-        reward = abs(target - current_price)
+        entry = order.get("entry_price") or current_price
+        risk = abs(entry - stop)
+        reward = abs(target - entry)
         evol = get_active_thresholds()
-        rr_min = evol.get("rr_ratio", 1.5)
+
+        alignment_rule = verdict.get("alignment_rule", "") or ""
+        is_trending = "trending" in alignment_rule and "4h" in alignment_rule
+        rr_min = evol.get("rr_ratio", 1.5) if is_trending else 0.5
+
         if risk > 0 and reward / risk < rr_min:
             return  # RR too low, skip
 
     strength = verdict.get("strength", "")
     direction = verdict.get("direction", "")
     confidence = verdict.get("confidence", 0)
-    entry_reason = f"{regime} {direction} {strength} (conf:{confidence}, lev:{leverage}x)"
+    alignment_rule = verdict.get("alignment_rule", "") or ""
 
-    # Calculate position size in BTC: 2% risk model (same as frontend)
+    # Dynamic risk model: adjust risk_pct by signal quality
+    if confidence >= 70 and strength == "强" and "4h trending" in alignment_rule:
+        risk_pct = 0.05  # 5% — 极强趋势
+    elif confidence >= 60 and strength in ("强", "中等"):
+        risk_pct = 0.03  # 3% — 高确信
+    else:
+        risk_pct = 0.02  # 2% — 默认
+
+    entry_reason = f"{regime} {direction} {strength} (conf:{confidence}, lev:{leverage}x, risk:{int(risk_pct*100)}%)"
+
+    # Calculate position size in BTC: dynamic risk model
     initial_balance = settings.sim_initial_balance
 
     # Check available balance: current_balance = initial + realized_pnl
@@ -427,8 +510,8 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
     risk_pct = 0.02  # 2% risk per trade
     stop_distance = abs(current_price - stop) if stop else current_price * 0.02
 
-    # Correct 2% risk model:
-    # risk_amount = balance * 2%  (max loss when stop hits)
+    # Dynamic risk model:
+    # risk_amount = balance * risk_pct  (max loss when stop hits)
     # position_btc = risk_amount / stop_distance  (BTC qty that loses exactly risk_amount)
     # margin = position_btc * entry_price / leverage  (capital required)
     risk_amount = available_balance * risk_pct
@@ -470,6 +553,17 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
     )
     conn.commit()
 
+    # Fire open hooks (auto-trader mirror)
+    new_pos = {
+        "id": position_id, "side": side, "entry_price": round(current_price, 1),
+        "position_size": round(position_btc, 6), "leverage": leverage,
+    }
+    for hook in _auto_open_hooks:
+        try:
+            hook(conn, new_pos, verdict, current_price)
+        except Exception:
+            pass  # hook failure must not break position management
+
 
 def manage_simulated_position(conn, data: dict, current_price: float):
     """Main entry point: manage simulated positions on each signal cycle.
@@ -480,10 +574,11 @@ def manage_simulated_position(conn, data: dict, current_price: float):
       3. Emergency exit (high volatility + opposite, ADX dead)
       4. Signal reversal
       5. ADX trailing stop
-      6. Exit signal
-      7. Reduce signal (max 2, then auto-exit)
-      8. Add signal (pyramid add, max 3)
-      9. Hold
+      6. Trend exhaustion (early warning, regime may not be "exhaustion")
+      7. Exit signal
+      8. Reduce signal (max 2, then auto-exit)
+      9. Add signal (pyramid add, max 3)
+      10. Hold
     """
     now = time.time()
     verdict = data.get("verdict", {})
@@ -520,6 +615,10 @@ def manage_simulated_position(conn, data: dict, current_price: float):
 
         # ADX trailing stop (new)
         if _check_adx_trailing_stop(conn, sim_pos, verdict, current_price):
+            return
+
+        # Trend exhaustion: early warning even when regime != "exhaustion"
+        if _check_trend_exhaustion(conn, sim_pos, verdict, current_price):
             return
 
         _manage_open_position(conn, sim_pos, verdict, current_price, now)

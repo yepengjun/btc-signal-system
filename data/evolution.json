@@ -12,7 +12,7 @@
   "vol_adjustment_factor": 0.1,
   "atr_stop_multiplier": 2.2,
   "rr_ratio": 1.5,
-  "last_updated": 1778791486.9547808,
+  "last_updated": 1778791545.7585568,
   "tf_thresholds": {
     "30m": {
       "adx_trending_threshold": 24.5,

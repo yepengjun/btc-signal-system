@@ -21,5 +21,8 @@ class Settings:
     # Simulated trading
     sim_initial_balance: float = float(os.getenv("SIM_INITIAL_BALANCE", "10000"))
 
+    # Auto trade (mirror sim positions to Hyperliquid)
+    auto_trade_enabled: bool = os.getenv("AUTO_TRADE_ENABLED", "false").lower() == "true"
+
 
 settings = Settings()

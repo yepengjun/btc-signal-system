@@ -106,6 +106,39 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # column already exists
 
+    # Signal type column (trend_following / exhaustion_reversal)
+    try:
+        c.execute("ALTER TABLE signals ADD COLUMN signal_type TEXT DEFAULT 'trend_following'")
+    except sqlite3.OperationalError:
+        pass
+
+    # Stage 1 signals: track whether a Stage 1 warning was later upgraded to Stage 2
+    try:
+        c.execute("ALTER TABLE signals ADD COLUMN stage2_upgraded INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
+    # Stage 1 statistics table (aggregated by signal type)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS stage1_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stage1_type TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            sample_count INTEGER DEFAULT 0,
+            direction_correct_pct REAL,
+            significant_move_pct REAL,
+            tp_hit_pct REAL,
+            sl_hit_pct REAL,
+            avg_mfe REAL,
+            avg_mae REAL,
+            stage2_upgrade_pct REAL,
+            avg_time_to_stage2 REAL,
+            avg_adx_rise REAL,
+            last_updated REAL,
+            UNIQUE(stage1_type, timeframe)
+        )
+    """)
+
     # Signal enhancement columns
     for col_sql in [
         "ALTER TABLE signals ADD COLUMN max_favorable_excursion REAL",
@@ -117,6 +150,18 @@ def init_db():
         "ALTER TABLE signals ADD COLUMN verify_price REAL",
         "ALTER TABLE signals ADD COLUMN verify_time REAL",
         "ALTER TABLE signals ADD COLUMN unverifiable INTEGER DEFAULT 0",
+    ]:
+        try:
+            c.execute(col_sql)
+        except sqlite3.OperationalError:
+            pass
+
+    # Regime split columns: decompose trend_persisted into sub-metrics
+    for col_sql in [
+        "ALTER TABLE signals ADD COLUMN move_sufficient INTEGER DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN structure_aligned INTEGER DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN regime_correct_loose INTEGER DEFAULT 0",
+        "ALTER TABLE signals ADD COLUMN longer_term_regime_valid INTEGER DEFAULT 0",
     ]:
         try:
             c.execute(col_sql)

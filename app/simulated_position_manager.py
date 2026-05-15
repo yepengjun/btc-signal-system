@@ -69,6 +69,17 @@ def calculate_pnl(position: dict, close_price: float) -> float:
 
 def close_simulated_position(conn, position: dict, close_price: float, reason: str):
     """Close a simulated position and record the reason and PnL."""
+    # Guard: skip if already closed (double-close protection)
+    if position.get("status") != "open":
+        return
+
+    # Double-check against DB to avoid in-memory stale state
+    db_row = conn.execute(
+        "SELECT id, status FROM positions WHERE id = ?", (position["id"],)
+    ).fetchone()
+    if not db_row or db_row["status"] != "open":
+        return
+
     pnl = calculate_pnl(position, close_price)
     now = time.time()
     conn.execute(
@@ -272,6 +283,12 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
     side = sim_pos["side"]
     pos_state = verdict.get("hold_long" if side == "long" else "hold_short", {})
     level = pos_state.get("level", "")
+
+    # Safety fallback: unexpected level values (e.g. "open", "wait" from no-position
+    # branch leaking due to future logic changes) should default to hold
+    if level not in ("exit", "reduce", "add", "hold", ""):
+        level = "hold"
+
     adx_4h = verdict.get("timeframes", {}).get("4h", {}).get("adx")
     reduce_count = sim_pos.get("reduce_count") or 0
     add_count = sim_pos.get("add_count") or 0
@@ -601,6 +618,12 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
     if position_btc > max_btc:
         position_btc = max_btc
 
+    # Final DB-level guard: prevent duplicate positions from concurrent calls
+    existing = conn.execute(
+        "SELECT id FROM positions WHERE status='open' AND is_simulated=1 LIMIT 1"
+    ).fetchone()
+    if existing:
+        return
 
     conn.execute(
         "INSERT INTO positions (side, entry_price, target, stop, leverage, "
@@ -684,8 +707,14 @@ def manage_simulated_position(conn, data: dict, current_price: float):
         if _check_signal_reversal(conn, sim_pos, verdict, current_price):
             return
 
+        if sim_pos.get("status") != "open":
+            return
+
         # ADX trailing stop (new)
         if _check_adx_trailing_stop(conn, sim_pos, verdict, current_price):
+            return
+
+        if sim_pos.get("status") != "open":
             return
 
         # Trend exhaustion: early warning even when regime != "exhaustion"

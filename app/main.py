@@ -651,10 +651,10 @@ async def api_record_action(position_id: int, request: Request):
         return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
     body = await request.json()
     conn = get_connection()
-    row = conn.execute("SELECT * FROM positions WHERE id = ?", (position_id,)).fetchone()
+    row = conn.execute("SELECT * FROM positions WHERE id = ? AND status = 'open'", (position_id,)).fetchone()
     if row is None:
         conn.close()
-        return JSONResponse({"detail": "Position not found"}, status_code=404)
+        return JSONResponse({"detail": "Position not found or already closed"}, status_code=404)
 
     action = body.get("action")  # add/reduce/exit
     adx_4h = body.get("adx_4h")

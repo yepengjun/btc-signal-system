@@ -598,6 +598,7 @@ body {
 .entry-market { font-size: 11px; padding: 3px 8px; border-radius: 4px; background: rgba(34,197,94,0.15); color: #22c55e; }
 .entry-limit { font-size: 11px; padding: 3px 8px; border-radius: 4px; background: rgba(59,130,246,0.15); color: #3b82f6; }
 .entry-wait { font-size: 11px; padding: 3px 8px; border-radius: 4px; background: rgba(239,68,68,0.15); color: #ef4444; }
+.order-decay { font-size: 11px; padding: 3px 10px; border-radius: 12px; background: rgba(234,179,8,0.15); color: #eab308; font-weight: 700; border: 1px solid rgba(234,179,8,0.3); }
 .conf-高 { background: rgba(34,197,94,0.15); color: #22c55e; }
 .conf-中 { background: rgba(234,179,8,0.15); color: #eab308; }
 .conf-低 { background: rgba(239,68,68,0.15); color: #ef4444; }
@@ -737,6 +738,7 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
           <span class="order-entry-type" :class="'entry-'+data.verdict.order_signal.entry_type">
             {{ {market:'市价',limit:'限价',wait:'等待'}[data.verdict.order_signal.entry_type] || '市价' }}
           </span>
+          <span v-if="data.verdict.order_signal.decay" class="order-decay">衰减·轻仓</span>
           <span class="order-confidence" :class="'conf-'+data.verdict.order_signal.confidence">
             {{ data.verdict.order_signal.confidence }}信心
           </span>
@@ -765,7 +767,7 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
         </div>
         <div class="order-footer">
           <span>杠杆 {{ data.verdict.order_signal.leverage }}</span>
-          <span>风险 2%</span>
+          <span>风险 {{ data.verdict.order_signal.decay ? '1' : '2' }}%</span>
           <span>仓位 ≤{{ data.verdict.order_signal.position_pct }}%</span>
         </div>
       </div>
@@ -1741,6 +1743,8 @@ createApp({
       const ctx = data.value?.verdict?.market_context;
       if (!ctx || !ctx.circuit_breaker) return '';
       const cb = ctx.circuit_breaker;
+      // Backend returns circuit_breaker as a string (reason) or null, NOT an object
+      if (typeof cb === 'string') return cb;
       if (cb.active) return cb.reason || '电路断路器触发';
       return '';
     });

@@ -223,9 +223,11 @@ def _analyze_position_state(
 
     # BREAKOUT: new trend starting → good for position
     if regime == "breakout" and pos_dir == direction:
+        # Use same strict add criteria as trending add-on (line 324)
+        can_add = adx4 >= 25 and adx_change >= 2 and momentum == "加速" and _confirm_add_signal(h4, position, price, h4.get("vol_percentile", 50))
         return {
             "action": "继续持有",
-            "level": "add" if adx4 >= 25 and adx_change >= 1 else "hold",
+            "level": "add" if can_add else "hold",
             "reason": f"市场突破盘整，{'看涨' if direction == 'bullish' else '看跌'}趋势启动",
             "target": h4.get("forecast", {}).get("target_conserv"),
             "stop": None,
@@ -422,7 +424,11 @@ def _check_price_divergence(history_rows: list, position: dict | None, h4: dict)
 
 
 def _get_peak_adx_from_history(history_rows: list) -> float:
-    """Get peak ADX from history within last 24 hours."""
+    """Get peak ADX from history within last 24 hours (rolling time window).
+
+    Uses a 24-hour cutoff so peak ADX naturally decays after a trend ends,
+    avoiding permanent EXHAUSTED status from an old peak.
+    """
     if not history_rows:
         return 0
     import time
@@ -838,7 +844,15 @@ def _analyze_single_timeframe(candles: list[dict], timeframe: str, thresholds: d
     elif is_low_vol:
         regime = "low_volatility"
     else:
-        regime = "ranging"
+        # Fallback: check for strong directional move despite low ADX.
+        # During sharp one-sided drops/rallys, ADX lags because DX averages
+        # over 14 periods. Wide DI spread + meaningful price move = directional
+        # trend even if ADX hasn't caught up yet.
+        di_spread_for_check = abs(plus_di - minus_di)
+        if di_spread_for_check >= 20 and atr_pct > 0.5:
+            regime = "forming"  # directional move confirmed by DI + price
+        else:
+            regime = "ranging"
 
     # DI spread filter: reject directional signals if DI spread too small
     di_spread = abs(plus_di - minus_di)
@@ -951,6 +965,8 @@ def _analyze_single_timeframe(candles: list[dict], timeframe: str, thresholds: d
         "adx_decay": round(adx_decay, 1),
         "plus_di": plus_di,
         "minus_di": minus_di,
+        "plus_di_series": adx_data.get("plus_di_series", [])[-20:],
+        "minus_di_series": adx_data.get("minus_di_series", [])[-20:],
         "dx_series": adx_data.get("dx_series", [])[-20:],
         "regime": regime,
         "direction": direction,
@@ -1288,7 +1304,7 @@ def _check_squeeze(
     else:
         compression = 0
     active = band_width < recent_atr * 1.5
-    duration_hours = _estimate_squeeze_duration(candles, atr)
+    duration_hours = _estimate_squeeze_duration(candles, atr, timeframe)
     return {
         "active": active,
         "compression": max(compression, 0),
@@ -1297,7 +1313,7 @@ def _check_squeeze(
     }
 
 
-def _estimate_squeeze_duration(candles: list[dict], atr: float) -> int:
+def _estimate_squeeze_duration(candles: list[dict], atr: float, timeframe: str) -> int:
     """Estimate how many hours the squeeze has been active."""
     closes = [c["close"] for c in candles[-40:]]
     if len(closes) < 25:
@@ -1313,8 +1329,10 @@ def _estimate_squeeze_duration(candles: list[dict], atr: float) -> int:
             count += 1
         else:
             break
-    # Each candle is ~4h (since we use 200 candles from the 4h fetch)
-    return max(0, round(count * 0.5))
+    # Map timeframe to candle duration in hours
+    candle_hours = {"30m": 0.5, "1h": 1, "4h": 4}
+    hours_per_candle = candle_hours.get(timeframe, 4)
+    return max(0, count * hours_per_candle)
 
 
 def _order_confidence(rr: float, verdict_confidence: int) -> str:
@@ -1521,9 +1539,9 @@ def _check_aggressive_1h_trend(h4, h1, h30, all_thresholds) -> dict | None:
     """Strategy 1: Single timeframe trend — 1h trending without 4h confirmation."""
     if h4["regime"] in ("exhaustion", "high_volatility"):
         return None
-    if h1["regime"] not in ("trending", "breakout"):
+    if h1["regime"] not in ("trending", "breakout", "forming"):
         return None
-    if h1.get("adx", 0) < 25:
+    if h1.get("adx", 0) < 20:  # lowered from 25 to catch forming trends
         return None
     h1_di_spread = h1.get("di_spread", 0)
     if h1_di_spread < 8:
@@ -2105,7 +2123,7 @@ def _check_aggressive_signals(
     if persistent_fires:
         stype, result = persistent_fires[0]
     else:
-        stype, result = fires[0]
+        stype, result, _ = fires[0]
 
     result["_aggressive"] = True
     result["_cooldown_ts"] = now
@@ -2278,11 +2296,14 @@ def generate_verdict(
                 circuit_breaker_reason = f"清算级联：24h 波动 {price_change:.1f}% + 量能 {latest_vol/avg_vol:.1f}x"
 
     # ─── Trend Exhaustion & Late-Trend Filters ───────────────────────────
-    # These run AFTER multi-TF alignment but BEFORE action advice.
-    # They block entries when the trend is at its tail end, even if
-    # regime classification still says "trending".
-    trend_exhausted = False
+    # Three-tier decay model (not binary block):
+    #   NONE      — no decay, normal entries
+    #   DECAYING  — trend weakening but still valid, allow with reduced risk (1%)
+    #   EXHAUSTED — trend over (ADI extreme or below threshold), block entries
+    trend_decay_level = "NONE"  # NONE | DECAYING | EXHAUSTED
     exhaustion_reason = None
+
+    h4_adx_threshold = tf_cfg.get("4h", {}).get("adx_trending_threshold", 25)
 
     # Filter 1: ADX ceiling — extreme ADX means trend is mature/ending.
     # ADX > 45 is rarely sustainable in crypto; new entries at this level are chasing.
@@ -2291,37 +2312,81 @@ def generate_verdict(
     if h4["adx"] > adx_ceiling and h1["adx"] > adx_ceiling:
         # Both 4h and 1h at extreme — trend is very mature
         if not (h4["adx_fast"] > h4["adx_slow"] + 5 and h1["adx_fast"] > h1["adx_slow"] + 5):
-            trend_exhausted = True
+            trend_decay_level = "EXHAUSTED"
             exhaustion_reason = f"ADX极值（4h={h4['adx']:.0f}, 1h={h1['adx']:.0f}），趋势末端，禁止追单"
     elif h4["adx"] > adx_ceiling:
-        # Only 4h at extreme — still risky, require strong momentum
+        # Only 4h at extreme — risky but not necessarily over
         if not (h4["adx_fast"] > h4["adx_slow"] + 5):
-            trend_exhausted = True
-            exhaustion_reason = f"4h ADX={h4['adx']:.0f}超阈值，趋势可能即将衰竭"
+            trend_decay_level = "DECAYING"
+            exhaustion_reason = f"4h ADX={h4['adx']:.0f}超阈值，趋势可能即将衰减"
 
     # Filter 2: ADX falling from peak — trend is actively decaying.
-    # Peak ADX tracked from historical signals; a drop > 5 points means
-    # the trend has peaked and is winding down.
-    if not trend_exhausted and peak_adx > 0:
-        adx_fall = peak_adx - h4["adx"]
-        if adx_fall > 5:
-            trend_exhausted = True
-            exhaustion_reason = f"ADX从峰值{peak_adx:.0f}回落至{h4['adx']:.0f}（- {adx_fall:.0f}），趋势已衰减"
+    # Peak ADX is tracked from last 24h of verdict_history (rolling window).
+    # Uses relative drop (20% of peak) instead of fixed 5 points, which adapts
+    # to different ADX levels (ADX 40→32 is different from 25→20).
+    # Short-circuit: if already EXHAUSTED from Filter 1, skip remaining filters.
+    if trend_decay_level == "EXHAUSTED":
+        pass  # already blocked, skip Filters 2-4
+    elif peak_adx > 0:
+        adx_drop_pct = (peak_adx - h4["adx"]) / max(peak_adx, 1)
+        h4_di_spread = abs(h4["plus_di"] - h4["minus_di"])
+        di_crossed = h4_di_spread < 5  # DI spread < 5 = direction uncertain
+
+        if adx_drop_pct >= 0.20:
+            # ADX dropped ≥20% from peak — significant decay
+            # Soft zone: allow DECAYING if ADX is within 1 point of threshold,
+            # to avoid hard boundary effects (e.g., 24.9 vs 25.0 shouldn't
+            # flip from DECAYING to EXHAUSTED).
+            soft_zone = h4_adx_threshold - 1.0
+            if h4["adx"] >= h4_adx_threshold:
+                trend_decay_level = "DECAYING"
+                exhaustion_reason = f"ADX从峰值{peak_adx:.0f}回落至{h4['adx']:.0f}（- {adx_drop_pct*100:.0f}%），趋势已衰减"
+                if di_crossed:
+                    trend_decay_level = "EXHAUSTED"
+                    exhaustion_reason = f"ADX从峰值{peak_adx:.0f}回落至{h4['adx']:.0f}（- {adx_drop_pct*100:.0f}%），DI差收窄（{h4_di_spread:.0f}），趋势已结束"
+            elif h4["adx"] >= soft_zone:
+                # ADX slightly below threshold but close — still allow DECAYING
+                trend_decay_level = "DECAYING"
+                exhaustion_reason = f"ADX从峰值{peak_adx:.0f}回落至{h4['adx']:.0f}（- {adx_drop_pct*100:.0f}%），略低于趋势阈值"
+                if di_crossed:
+                    exhaustion_reason += "，DI差收窄，谨慎观望"
+            else:
+                # ADX significantly below threshold — but check if DI spread
+                # is still wide (strong directional conviction despite ADX drop).
+                # During sharp one-sided moves, ADX can compress as DI becomes
+                # extremely one-sided (minus_DI dominates), which doesn't mean
+                # the trend is over — it means it's very directional.
+                if h4_di_spread >= 15:
+                    trend_decay_level = "DECAYING"
+                    exhaustion_reason = f"ADX从峰值{peak_adx:.0f}回落至{h4['adx']:.0f}（- {adx_drop_pct*100:.0f}%），低于趋势阈值，但DI差仍大（{h4_di_spread:.0f}），趋势仍在"
+                elif di_crossed:
+                    trend_decay_level = "EXHAUSTED"
+                    exhaustion_reason = f"ADX从峰值{peak_adx:.0f}回落至{h4['adx']:.0f}（- {adx_drop_pct*100:.0f}%），DI差收窄（{h4_di_spread:.0f}），趋势已结束"
+                else:
+                    # ADX below threshold and neither wide spread nor DI cross
+                    # — moderate decay, let it through but flag as DECAYING
+                    trend_decay_level = "DECAYING"
+                    exhaustion_reason = f"ADX从峰值{peak_adx:.0f}回落至{h4['adx']:.0f}（- {adx_drop_pct*100:.0f}%），趋势动能减弱"
+        elif adx_drop_pct >= 0.10:
+            # ADX dropped 10-20% — mild decay, note but don't block
+            if di_crossed:
+                trend_decay_level = "DECAYING"
+                exhaustion_reason = f"ADX从峰值{peak_adx:.0f}回落至{h4['adx']:.0f}（- {adx_drop_pct*100:.0f}%），DI差收窄（{h4_di_spread:.0f}），趋势动能减弱"
 
     # Filter 3: DI convergence — +DI and -DI closing in means directional
     # momentum is fading. Only trigger when ADX > 30: at low ADX (<30) small
     # DI spread is normal for weak trends; at high ADX (>30) a small spread
     # means "high strength but no direction" — a fake trend.
     h4_di_spread = abs(h4["plus_di"] - h4["minus_di"])
-    if not trend_exhausted and h4_di_spread < 8 and h4["adx"] > 30:
-        trend_exhausted = True
-        exhaustion_reason = f"DI差收窄（{h4_di_spread:.0f}），趋势动能减弱"
+    if trend_decay_level == "NONE" and h4_di_spread < h4["adx"] * 0.25 and h4["adx"] > 30:
+        trend_decay_level = "DECAYING"
+        exhaustion_reason = f"DI差收窄（{h4_di_spread:.0f} < ADX*0.25={h4['adx']*0.25:.0f}），趋势动能减弱"
 
     # Filter 4: Price structure reversal — last 3 candles show reversal pattern.
     # Bearish: if last 2 candles are bullish (close > open) and the last candle
     # engulfs the previous one, the downtrend is reversing.
     # Bullish: opposite — last 2 candles bearish + engulfing.
-    if not trend_exhausted and len(all_candles_4h) >= 4:
+    if trend_decay_level == "NONE" and len(all_candles_4h) >= 4:
         last3 = all_candles_4h[-3:]
         c0, c1, c2 = last3[0], last3[1], last3[2]
         # Check for reversal candlestick pattern
@@ -2334,16 +2399,16 @@ def generate_verdict(
             lower_shadow = c2["close"] - c2["low"] if c2["close"] > c2["open"] else c2["open"] - c2["low"]
             long_shadow = lower_shadow > (last_range * 0.5) if last_range > 0 else False
             if bullish_count >= 2 and long_shadow:
-                trend_exhausted = True
-                exhaustion_reason = "价格结构反转：连续阳线+长下影，看跌动能衰竭"
+                trend_decay_level = "DECAYING"
+                exhaustion_reason = "价格结构反转：连续阳线+长下影，看跌动能衰减"
         elif h4["direction"] == "bullish":
             bearish_count = sum(1 for c in last3 if c["close"] < c["open"])
             last_range = c2["high"] - c2["low"]
             upper_shadow = c2["high"] - c2["close"] if c2["close"] < c2["open"] else c2["high"] - c2["open"]
             long_upper = upper_shadow > (last_range * 0.5) if last_range > 0 else False
             if bearish_count >= 2 and long_upper:
-                trend_exhausted = True
-                exhaustion_reason = "价格结构反转：连续阴线+长上影，看涨动能衰竭"
+                trend_decay_level = "DECAYING"
+                exhaustion_reason = "价格结构反转：连续阴线+长上影，看涨动能衰减"
 
     # ─── Filter 5: DI Convergence Warning ──────────────────────────────
     # Detect trend weakening BEFORE exhaustion kicks in.
@@ -2538,6 +2603,27 @@ def generate_verdict(
                 ),
             }
 
+    # Priority 2b: 4h forming + 1h forming, same direction with wide DI spread
+    # → all-TF directional alignment, allow light entry
+    elif h4_reg == "forming" and h1_reg == "forming" and h4.get("direction") and h4["direction"] == h1.get("direction"):
+        alignment_rule = "规则2b: 4h+1h 同时 forming 同向确认"
+        h4_forming_quality = True
+        h4["direction"] = h1["direction"]  # ensure alignment
+        confidence = max(30, h4["confidence"] - 5)
+        # Stage 1: light entry
+        stage_1_warning = {
+            "type": "trend_startup",
+            "direction": h1["direction"],
+            "direction_label": "看涨" if h1["direction"] == "bullish" else "看跌",
+            "confidence": 30,
+            "position_pct_hint": 10,
+            "reason": (
+                f"4h+1h同时形成态（{'看涨' if h1['direction'] == 'bullish' else '看跌'}），"
+                f"4h ADX={h4['adx']:.0f}, 1h ADX={h1['adx']:.0f}，"
+                f"多时间框架方向一致，可轻仓试探"
+            ),
+        }
+
     # Priority 3: 4h ranging/low_vol_trend → check for breakout or low-vol trend
     elif h4_reg == "ranging":
         # ─── Ranging Breakout: 4h ranging + 1h/30m breakout 轻仓试单 ───
@@ -2549,7 +2635,7 @@ def generate_verdict(
 
         # Conditions for ranging breakout:
         # (a) 1h has clear direction (DI spread > 8)
-        # (b) 1h is trending or breakout
+        # (b) 1h is trending, breakout, OR forming (sharp moves can have low ADX)
         # (c) 30m confirms same direction
         # (d) 4h DI spread not extremely low (< 3 means truly dead)
         # (e) Macro filter: block bearish breakout in macro bull
@@ -2575,7 +2661,7 @@ def generate_verdict(
                 for s in recent_p3_signals if s.get("direction") == h1_dir
             )
 
-        if (h1_reg in ("trending", "breakout") and h1_dir
+        if (h1_reg in ("trending", "breakout", "forming") and h1_dir
                 and h30_dir == h1_dir
                 and h1_di_spread > 8
                 and h4_di_spread >= 3
@@ -2790,7 +2876,7 @@ def generate_verdict(
         and h4.get("direction") != orig_h4_direction
         and h4.get("signal_type") == "exhaustion_reversal"
     )
-    if trend_exhausted and not is_reversal_signal:
+    if trend_decay_level == "EXHAUSTED" and not is_reversal_signal:
         action = "趋势末端禁止入场"
         side = "观望"
         reason = exhaustion_reason
@@ -2873,7 +2959,6 @@ def generate_verdict(
                 action = "做空"
                 side = "空"
                 reason = "4h+1h 趋势一致看跌"
-                h4["signal_type"] = "trend_following"
                 h4["signal_type"] = "trend_following"
         else:
             if macro.get("is_bull") or macro.get("is_bull_pullback"):
@@ -2975,10 +3060,20 @@ def generate_verdict(
         side = "观望"
         reason = "市场处于盘整，等待突破"
 
+    # ─── Decay Entry Flag ──────────────────────────────────────────────────
+    # Trend is weakening but still valid (ADX > threshold). Allow entry with reduced risk.
+    _decay_entry = trend_decay_level == "DECAYING" and side != "观望"
+
+    # ─── Stage 1 stop/target override ───
+    # Stage1 signals use 30m ATR for stop (signal timeframe matches risk).
+    # Target ensures RR ≥ 1.2 — either 4h conserv target or stop×1.2.
+    _stage1_stop = None
+    _stage1_target = None
+
     # ─── Stage 1 Fallback: when main signal says 观望 but Stage 1 fires ───
     # This makes the two-stage system actionable: even if multi-TF alignment
     # says wait, a Stage 1 warning can trigger a light entry (10-15%).
-    if side == "观望" and stage_1_warning:
+    if side == "观望" and trend_decay_level != "EXHAUSTED" and stage_1_warning:
         s1 = stage_1_warning
         direction_label = "涨" if s1["direction"] == "bullish" else "跌"
         action = f"Stage1预警（轻仓试{direction_label}）"
@@ -3005,13 +3100,7 @@ def generate_verdict(
     _aggressive_position_pct = None
     _aggressive_entry_note = None
 
-    # ─── Stage 1 stop/target override ───
-    # Stage1 signals use 30m ATR for stop (signal timeframe matches risk).
-    # Target ensures RR ≥ 1.2 — either 4h conserv target or stop×1.2.
-    _stage1_stop = None
-    _stage1_target = None
-
-    if side == "观望":
+    if side == "观望" and trend_decay_level != "EXHAUSTED":
         aggressive = _check_aggressive_signals(
             h4, h1, h30, all_candles_4h, all_thresholds, market_ctx, macro,
         )
@@ -3219,6 +3308,20 @@ def generate_verdict(
         reward_at_current = abs(target - current_price)
         current_rr = round(reward_at_current / max(risk_at_current, 1), 2)
 
+    # DECAYING entries: tighten stop to 30m ATR when RR is poor (late entry).
+    # When trend is detected after the move has started, 4h stop is too wide
+    # and target is already close → bad RR. Tighter stop improves RR ratio.
+    if _decay_entry and side in ("多", "空") and current_rr is not None and current_rr < 1.0:
+        tight_stop_dist = h30["atr"] * 1.5
+        if side == "多":
+            new_stop = round(current_price - tight_stop_dist, 1)
+            if new_stop > stop:  # long: higher stop = tighter
+                stop = new_stop
+        else:
+            new_stop = round(current_price + tight_stop_dist, 1)
+            if new_stop < stop:  # short: lower stop = tighter
+                stop = new_stop
+
     if side == "多":
         # Price past target: signal opportunity already gone — check FIRST
         _price_past_target_long = target and current_price >= target * 0.999
@@ -3236,8 +3339,9 @@ def generate_verdict(
         reward = abs(target - entry_price)
         rr = round(reward / max(risk, 1), 2)
         # Safety: if current RR < 1.0, market moved too far — force wait
-        # But Stage 1 signals are exploratory — switch to market entry instead of blocking
-        if current_rr is not None and current_rr < 1.0 and not stage_1_warning:
+        # But Stage 1 signals are exploratory — switch to market entry instead of blocking.
+        # DECAYING entries use tightened stops (30m ATR) which already account for late entry.
+        if current_rr is not None and current_rr < 1.0 and not stage_1_warning and not _decay_entry:
             side = "观望"
             entry_action = "wait"
             entry_note = f"现价盈亏比过低（{current_rr:.2f}），价格已偏离入场位，等待回调至 {entry_price:.0f} 附近再入场（目标 {target:.0f}，止损 {stop:.0f}）"
@@ -3259,6 +3363,7 @@ def generate_verdict(
                 "current_rr": current_rr,
                 "position_pct": position_pct,
                 "leverage": leverage_str,
+                "decay": False,
                 "confidence": _order_confidence(rr, confidence),
             }
         else:
@@ -3267,6 +3372,10 @@ def generate_verdict(
             risk_price_pct = risk / max(entry_price, 1) * 100
             max_safe_pct = 2.0 / max(leverage_num * risk_price_pct / 100, 0.01)
             position_pct = round(min(base_pct, max_safe_pct), 1)
+            # Decay: reduce risk to 1%
+            if _decay_entry:
+                position_pct = 1.0
+                entry_note = f"趋势衰减中，轻仓试探（1%风险）"
             order_signal = {
                 "side": "做多",
                 "entry_type": entry_action,
@@ -3280,6 +3389,7 @@ def generate_verdict(
                 "current_rr": current_rr,
                 "position_pct": position_pct,
                 "leverage": leverage_str,
+                "decay": _decay_entry,
                 "confidence": _order_confidence(rr, confidence),
             }
     elif side == "空":
@@ -3298,8 +3408,9 @@ def generate_verdict(
         reward = abs(target - entry_price)
         rr = round(reward / max(risk, 1), 2)
         # Safety: if current RR < 1.0, market moved too far — force wait
-        # But Stage 1 signals are exploratory — switch to market entry instead of blocking
-        if current_rr is not None and current_rr < 1.0 and not stage_1_warning:
+        # But Stage 1 signals are exploratory — switch to market entry instead of blocking.
+        # DECAYING entries use tightened stops (30m ATR) which already account for late entry.
+        if current_rr is not None and current_rr < 1.0 and not stage_1_warning and not _decay_entry:
             side = "观望"
             entry_action = "wait"
             entry_note = f"现价盈亏比过低（{current_rr:.2f}），价格已偏离入场位，等待反弹至 {entry_price:.0f} 附近再入场（目标 {target:.0f}，止损 {stop:.0f}）"
@@ -3321,6 +3432,7 @@ def generate_verdict(
                 "current_rr": current_rr,
                 "position_pct": position_pct,
                 "leverage": leverage_str,
+                "decay": False,
                 "confidence": _order_confidence(rr, confidence),
             }
         else:
@@ -3329,6 +3441,9 @@ def generate_verdict(
             risk_price_pct = risk / max(entry_price, 1) * 100
             max_safe_pct = 2.0 / max(leverage_num * risk_price_pct / 100, 0.01)
             position_pct = round(min(base_pct, max_safe_pct), 1)
+            if _decay_entry:
+                position_pct = 1.0
+                entry_note = f"趋势衰减中，轻仓试探（1%风险）"
             order_signal = {
                 "side": "做空",
                 "entry_type": entry_action,
@@ -3342,6 +3457,7 @@ def generate_verdict(
                 "current_rr": current_rr,
                 "position_pct": position_pct,
                 "leverage": leverage_str,
+                "decay": _decay_entry,
                 "confidence": _order_confidence(rr, confidence),
             }
     else:
@@ -3356,6 +3472,7 @@ def generate_verdict(
             "rr_ratio": None,
             "position_pct": None,
             "leverage": None,
+            "decay": False,
             "confidence": "低",
         }
 
@@ -3377,7 +3494,8 @@ def generate_verdict(
                 "entry_note": f"价格已跌至目标 {target:.0f} 附近，做空机会已错过",
                 "target": None, "stop": None,
                 "risk": None, "reward": None, "rr_ratio": None,
-                "position_pct": None, "leverage": None, "confidence": "低",
+                "position_pct": None, "leverage": None, "decay": False,
+                "confidence": "低",
             }
             action = "观望"
             reason = "价格已到达目标位，做空机会已错过"
@@ -3388,7 +3506,8 @@ def generate_verdict(
                 "entry_note": f"价格已涨至目标 {target:.0f} 附近，做多机会已错过",
                 "target": None, "stop": None,
                 "risk": None, "reward": None, "rr_ratio": None,
-                "position_pct": None, "leverage": None, "confidence": "低",
+                "position_pct": None, "leverage": None, "decay": False,
+                "confidence": "低",
             }
             action = "观望"
             reason = "价格已到达目标位，做多机会已错过"
@@ -3535,9 +3654,10 @@ def generate_verdict(
                 "aggressive_signal": h4.get("signal_type", "") if h4.get("signal_type", "").startswith("aggressive_") else None,
                 "macro_context": macro,
                 "trend_exhausted": {
-                    "detected": trend_exhausted and not is_reversal_signal,
-                    "direction": orig_h4_direction if (trend_exhausted and not is_reversal_signal) else None,
-                    "reason": exhaustion_reason if (trend_exhausted and not is_reversal_signal) else None,
+                    "detected": trend_decay_level != "NONE" and not is_reversal_signal,
+                    "level": trend_decay_level if trend_decay_level != "NONE" else None,
+                    "direction": orig_h4_direction if (trend_decay_level != "NONE" and not is_reversal_signal) else None,
+                    "reason": exhaustion_reason if (trend_decay_level != "NONE" and not is_reversal_signal) else None,
                 },
             },
             "timeframes": {

@@ -239,18 +239,28 @@ def verify_pending_signals():
             min_move_dynamic = max(atr_pct_price * tf_atr_mult_min.get(tf, 0.3), tf_min_move_floor.get(tf, 0.05))
             sig_move_dynamic = max(atr_pct_price * tf_atr_mult_sig.get(tf, 0.5), tf_min_move_floor.get(tf, 0.05) * 1.5)
 
+            # Pre-compute move magnitude — needed by direction check below.
+            move_pct = abs(current_price - price_at_signal) / max(price_at_signal, 1) * 100
+
             # 1. Direction check (for ranging signals, direction_correct = 1 since direction N/A)
+            # For directional signals, require at least the minimum ATR-based move.
+            # Price moving 0.01% in the "right" direction is noise, not confirmation.
             if is_ranging:
                 direction_correct = 1
                 actual_direction = "neutral"
             else:
-                actual_direction = (
+                move_direction = (
                     "bullish" if current_price >= price_at_signal else "bearish"
                 )
-                direction_correct = 1 if actual_direction == direction else 0
+                # Only count as direction-correct if move exceeds minimum ATR threshold
+                if move_direction == direction and move_pct >= min_move_dynamic:
+                    direction_correct = 1
+                else:
+                    direction_correct = 0
+                # actual_direction based on actual price movement
+                actual_direction = move_direction
 
             # 2. Magnitude check — now ATR-based (replaces fixed percentages)
-            move_pct = abs(current_price - price_at_signal) / max(price_at_signal, 1) * 100
             significant_move = move_pct >= sig_move_dynamic
 
             # 2b. Ranging-specific: check that no trend developed.
@@ -578,7 +588,9 @@ def _compute_evolution_adjustments(stats: dict) -> dict:
                 break
 
         # ─── Force correction: bypass last_verified when consecutive wrong >= 3
-        if consecutive_wrong >= 3:
+        # Only allow force correction when we have enough verified signals (>=10)
+        # to avoid overreacting to short streaks with tiny sample sizes.
+        if consecutive_wrong >= 3 and verified >= 10:
             floor, _ = THRESHOLD_BOUNDS["adx_trending_threshold"]
             if tf_trending <= floor + 0.5:
                 # Already at floor: only mark unreliable if overall accuracy is also poor.
@@ -603,14 +615,17 @@ def _compute_evolution_adjustments(stats: dict) -> dict:
             tf_cfg["consecutive_wrong_regime"] = 0
             tf_cfg["unreliable"] = False
 
-        # ─── Normal adjustment: only when new signals verified
+        # ─── Normal adjustment: only when enough signals verified (>=20)
+        # Below 20, use gray-zone micro-tuning only to prevent runaway drift
+        # from small sample sizes.
         last_verified = last_counts.get(tf, 0)
         if verified <= last_verified:
             continue
 
         new_params[tf] = verified  # Mark that we'll adjust for this TF
 
-        if verified >= 5:
+        if verified >= 20:
+            # Full adjustment: regime/dir accuracy driven
             # Regime accuracy → adjust this TF's trending threshold
             if regime_acc > 70:
                 new_val = _clamp("adx_trending_threshold", tf_trending - 1)

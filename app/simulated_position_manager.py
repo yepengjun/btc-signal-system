@@ -78,6 +78,13 @@ def close_simulated_position(conn, position: dict, close_price: float, reason: s
     )
     conn.commit()
 
+    # Also update in-memory dict for callers that track status
+    position["status"] = "closed"
+    position["close_price"] = close_price
+    position["close_reason"] = reason
+    position["pnl"] = round(pnl, 2)
+    position["closed_at"] = now
+
     # Fire close hooks (auto-trader mirror)
     for hook in _auto_close_hooks:
         try:
@@ -133,8 +140,13 @@ def _check_emergency_exit(conn, sim_pos: dict, verdict: dict, current_price: flo
             close_simulated_position(conn, sim_pos, current_price, "emergency_high_vol")
             return True
 
-    adx_exit = 20
-    if adx_4h and adx_4h < adx_exit:
+    # ADX dead: require BOTH absolute low AND significant drop from entry.
+    # Prevents healthy ADX fluctuations from prematurely closing positions
+    # opened during low-volatility trends.
+    entry_adx = sim_pos.get("entry_adx") or adx_4h
+    adx_exit_threshold = 20
+    adx_drop_from_entry = 5  # must have dropped meaningfully from entry
+    if adx_4h and adx_4h < adx_exit_threshold and adx_4h < (entry_adx - adx_drop_from_entry):
         close_simulated_position(conn, sim_pos, current_price, "emergency_adx_dead")
         return True
 
@@ -167,15 +179,28 @@ def _check_signal_reversal(conn, sim_pos: dict, verdict: dict, current_price: fl
     return False
 
 
-def _check_trend_exhaustion(conn, sim_pos: dict, verdict: dict, current_price: float) -> bool:
+def _check_trend_exhaustion(conn, sim_pos: dict, verdict: dict, current_price: float, now: float) -> bool:
     """Reduce position when verdict detects trend exhaustion matching position side.
 
     Acts as an early warning — fires even when regime != "exhaustion",
     catching ADX ceiling, DI convergence, and price structure reversal.
+
+    Grace period: newly opened positions (< 10 min) are exempt to avoid
+    immediate closure from transient exhaustion signals.
     """
+    created_at = sim_pos.get("created_at") or 0
+    if created_at > 0 and (now - created_at) < 600:  # 10-minute grace
+        return False
+
     market_ctx = verdict.get("market_context", {})
     exhausted = market_ctx.get("trend_exhausted", {})
     if not exhausted.get("detected"):
+        return False
+
+    # Only force-close on EXHAUSTED level. DECAYING means trend is weakening
+    # but still valid — let the position run with normal trailing logic.
+    level = exhausted.get("level", "EXHAUSTED")
+    if level == "DECAYING":
         return False
 
     exhausted_dir = exhausted.get("direction")
@@ -208,21 +233,31 @@ def _check_adx_trailing_stop(conn, sim_pos: dict, verdict: dict, current_price: 
     if adx_4h > max_adx - 8:
         return False
 
-    # Price-based confirmation: check if price crossed EMA20 against position
-    ema20 = tf_4h.get("price_structure", {})
-    # Fallback: use 30m entry_position range midpoint as EMA proxy
+    # Price-based confirmation: check if price crossed EMA20 against position.
+    # Use 4h EMA20 directly (computed in _analyze_single_timeframe and passed
+    # through verdict.timeframes['4h'].ema20).
+    tf_4h = verdict.get("timeframes", {}).get("4h", {})
+    ema20_4h = tf_4h.get("ema20")
     side = sim_pos["side"]
-    tf_30m = verdict.get("timeframes", {}).get("30m", {})
-    range_high = tf_30m.get("entry_position", {}).get("range_high", current_price)
-    range_low = tf_30m.get("entry_position", {}).get("range_low", current_price)
-    ema20_proxy = (range_high + range_low) / 2
 
-    if side == "long" and current_price < ema20_proxy:
-        close_simulated_position(conn, sim_pos, current_price, "adx_trailing_stop")
-        return True
-    if side == "short" and current_price > ema20_proxy:
-        close_simulated_position(conn, sim_pos, current_price, "adx_trailing_stop")
-        return True
+    if ema20_4h:
+        if side == "long" and current_price < ema20_4h:
+            close_simulated_position(conn, sim_pos, current_price, "adx_trailing_stop")
+            return True
+        if side == "short" and current_price > ema20_4h:
+            close_simulated_position(conn, sim_pos, current_price, "adx_trailing_stop")
+            return True
+    else:
+        # Fallback: use 4h price structure range midpoint (less accurate)
+        range_high = tf_4h.get("entry_position", {}).get("range_high", current_price)
+        range_low = tf_4h.get("entry_position", {}).get("range_low", current_price)
+        ema20_proxy = (range_high + range_low) / 2
+        if side == "long" and current_price < ema20_proxy:
+            close_simulated_position(conn, sim_pos, current_price, "adx_trailing_stop")
+            return True
+        if side == "short" and current_price > ema20_proxy:
+            close_simulated_position(conn, sim_pos, current_price, "adx_trailing_stop")
+            return True
 
     return False
 
@@ -305,6 +340,14 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
         return
 
     # Add signals - pyramid add-on (priority 7)
+    # Block adds during DECAYING — trend is weakening, no new exposure
+    order_signal = verdict.get("order_signal", {})
+    is_decay = order_signal.get("decay", False)
+
+    if level == "add" and is_decay:
+        # Skip add, fall through to hold with stop tightening
+        level = "hold"
+
     if level == "add" and add_count < MAX_ADD_COUNT:
         new_add_count = add_count + 1
         new_action_state = f"add_{new_add_count}"
@@ -385,6 +428,35 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
             )
             conn.commit()
 
+        # DECAYING: tighten stop toward breakeven (50% of profit distance),
+        # but ONLY when position is in profit (>= 1% from entry).
+        # Minimum 5-minute interval to avoid micro-adjustments.
+        if is_decay:
+            DECAY_TIGHTEN_INTERVAL = 5 * 60  # 5 minutes
+            last_tightened = sim_pos.get("last_decay_tightened") or sim_pos.get("updated_at") or 0
+            if now - last_tightened >= DECAY_TIGHTEN_INTERVAL:
+                current_stop = sim_pos.get("stop")
+                entry = sim_pos["entry_price"]
+                pos_side = sim_pos["side"]
+                if current_stop and entry and entry > 0:
+                    if pos_side == "long":
+                        pnl_pct = (current_price - entry) / entry
+                        new_stop = current_stop + (current_price - current_stop) * 0.5
+                        new_stop = min(new_stop, entry)
+                    elif pos_side == "short":
+                        pnl_pct = (entry - current_price) / entry
+                        new_stop = current_stop - (current_stop - current_price) * 0.5
+                        new_stop = max(new_stop, entry)
+                    else:
+                        pnl_pct = 0
+                        new_stop = current_stop
+                    if pnl_pct >= 0.01 and abs(new_stop - current_stop) > 1:
+                        conn.execute(
+                            "UPDATE positions SET stop=?, last_decay_tightened=? WHERE id=?",
+                            (round(new_stop, 1), now, sim_pos["id"]),
+                        )
+                        conn.commit()
+
 
 def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
     """Auto-open a simulated position if signal conditions are met.
@@ -451,8 +523,10 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
 
     # Verify risk:reward ratio — dynamic by signal type.
     # Trend signals (4h trending + aligned) use evolution rr_ratio (default 1.5).
-    # All other signals (aggressive/stage1/macro/ranging etc.) use 0.5 floor —
-    # position sizing already scales with RR (base_pct = 2.0/max(rr,1)).
+    # All other signals (aggressive/stage1/macro/ranging etc.) use 1.0 floor —
+    # 0.5 was too low, allowing poor-expectancy signals to open.
+    # DECAYING entries require RR ≥ 1.2 regardless of signal type.
+    is_decay = order.get("decay", False)
     if target and stop:
         entry = order.get("entry_price") or current_price
         risk = abs(entry - stop)
@@ -461,7 +535,10 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
 
         alignment_rule = verdict.get("alignment_rule", "") or ""
         is_trending = "trending" in alignment_rule and "4h" in alignment_rule
-        rr_min = evol.get("rr_ratio", 1.5) if is_trending else 0.5
+        rr_min = evol.get("rr_ratio", 1.5) if is_trending else 1.0
+
+        if is_decay:
+            rr_min = max(rr_min, 1.2)  # decay entries require RR ≥ 1.2 (light 1% risk)
 
         if risk > 0 and reward / risk < rr_min:
             return  # RR too low, skip
@@ -472,7 +549,9 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
     alignment_rule = verdict.get("alignment_rule", "") or ""
 
     # Dynamic risk model: adjust risk_pct by signal quality
-    if confidence >= 70 and strength == "强" and "4h trending" in alignment_rule:
+    if is_decay:
+        risk_pct = 0.01  # 1% — decay entry, reduced risk
+    elif confidence >= 70 and strength == "强" and "4h trending" in alignment_rule:
         risk_pct = 0.05  # 5% — 极强趋势
     elif confidence >= 60 and strength in ("强", "中等"):
         risk_pct = 0.03  # 3% — 高确信
@@ -507,7 +586,6 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
     if available_balance < 100:
         return  # Insufficient balance to open position (min 100 U)
 
-    risk_pct = 0.02  # 2% risk per trade
     stop_distance = abs(current_price - stop) if stop else current_price * 0.02
 
     # Dynamic risk model:
@@ -522,6 +600,7 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
     max_btc = max_notional / current_price
     if position_btc > max_btc:
         position_btc = max_btc
+
 
     conn.execute(
         "INSERT INTO positions (side, entry_price, target, stop, leverage, "
@@ -593,22 +672,14 @@ def manage_simulated_position(conn, data: dict, current_price: float):
         if _check_price_based_exit(conn, sim_pos, current_price):
             return
 
-        sim_pos_row = conn.execute(
-            "SELECT * FROM positions WHERE status='open' AND is_simulated=1 ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-        if not sim_pos_row:
+        if sim_pos.get("status") != "open":
             return
-        sim_pos = dict(sim_pos_row)
 
         if _check_emergency_exit(conn, sim_pos, verdict, current_price):
             return
 
-        sim_pos_row = conn.execute(
-            "SELECT * FROM positions WHERE status='open' AND is_simulated=1 ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-        if not sim_pos_row:
+        if sim_pos.get("status") != "open":
             return
-        sim_pos = dict(sim_pos_row)
 
         if _check_signal_reversal(conn, sim_pos, verdict, current_price):
             return
@@ -618,7 +689,7 @@ def manage_simulated_position(conn, data: dict, current_price: float):
             return
 
         # Trend exhaustion: early warning even when regime != "exhaustion"
-        if _check_trend_exhaustion(conn, sim_pos, verdict, current_price):
+        if _check_trend_exhaustion(conn, sim_pos, verdict, current_price, now):
             return
 
         _manage_open_position(conn, sim_pos, verdict, current_price, now)

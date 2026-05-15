@@ -196,6 +196,7 @@ def init_db():
         "ALTER TABLE positions ADD COLUMN adx_trailing_stop REAL",
         "ALTER TABLE positions ADD COLUMN position_size REAL",
         "ALTER TABLE positions ADD COLUMN realized_pnl REAL DEFAULT 0",
+        "ALTER TABLE positions ADD COLUMN last_decay_tightened REAL",
     ]:
         try:
             c.execute(col_sql)

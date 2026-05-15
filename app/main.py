@@ -89,12 +89,20 @@ def _refresh_live_prices(data: dict):
         order = data["verdict"].get("order_signal", {})
         if order and order.get("side") not in (None, "观望"):
             order["entry_price"] = current_price
-            if order["side"] == "做多":
-                order["risk"] = round(abs(current_price - order.get("stop", 0)), 1)
-                order["reward"] = round(abs(order.get("target", 0) - current_price), 1)
+            stop = order.get("stop")
+            target = order.get("target")
+            if stop is not None and target is not None:
+                if order["side"] == "做多":
+                    order["risk"] = round(abs(current_price - stop), 1)
+                    order["reward"] = round(abs(target - current_price), 1)
+                else:
+                    order["risk"] = round(abs(stop - current_price), 1)
+                    order["reward"] = round(abs(current_price - target), 1)
                 if order.get("risk", 0) > 0:
                     order["rr_ratio"] = round(order["reward"] / order["risk"], 2)
-                    order["position_pct"] = round(2.0 / max(order["rr_ratio"], 1), 1)
+                    # Don't override position_pct for decay entries
+                    if not order.get("decay", False):
+                        order["position_pct"] = round(2.0 / max(order["rr_ratio"], 1), 1)
     except Exception:
         pass
 
@@ -131,21 +139,23 @@ async def startup():
             return
 
         conn = get_connection()
-        sim_pos_row = conn.execute(
-            "SELECT * FROM positions WHERE status='open' AND is_simulated=1 ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
+        try:
+            sim_pos_row = conn.execute(
+                "SELECT * FROM positions WHERE status='open' AND is_simulated=1 ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
 
-        if sim_pos_row:
-            # Has open position: check price-based exits
-            _check_price_based_exit(conn, dict(sim_pos_row), current_price)
-        else:
-            # No open position: try auto-open using cached verdict
-            cached = _get_cached_signals()
-            if cached and cached.get("verdict"):
-                verdict = cached["verdict"]
-                data = {"verdict": verdict, "ticker": {"price": current_price}}
-                manage_simulated_position(conn, data, current_price)
-        conn.close()
+            if sim_pos_row:
+                # Has open position: check price-based exits
+                _check_price_based_exit(conn, dict(sim_pos_row), current_price)
+            else:
+                # No open position: try auto-open using cached verdict
+                cached = _get_cached_signals()
+                if cached and cached.get("verdict"):
+                    verdict = cached["verdict"]
+                    data = {"verdict": verdict, "ticker": {"price": current_price}}
+                    manage_simulated_position(conn, data, current_price)
+        finally:
+            conn.close()
 
     threading.Thread(target=_monitor_sim_positions, daemon=True).start()
 
@@ -197,11 +207,18 @@ async def websocket_endpoint(ws: WebSocket):
         await ws.close(code=1008)
         return
     import asyncio
+    last_signal_ts = 0.0
     while True:
         try:
-            data = _build_signals_response(force_refresh=True)
-            await ws.send_json(data)
-            await asyncio.sleep(settings.signal_interval_seconds)
+            now = time.time()
+            if now - last_signal_ts >= settings.signal_interval_seconds:
+                data = _build_signals_response(force_refresh=True)
+                await ws.send_json(data)
+                last_signal_ts = now
+            else:
+                # Heartbeat to keep connection alive between signal cycles
+                await ws.send_text("ping")
+            await asyncio.sleep(min(30, settings.signal_interval_seconds))
         except (WebSocketDisconnect, RuntimeError):
             break
 
@@ -219,329 +236,353 @@ def _build_signals_response(now: float = None, force_refresh: bool = False) -> d
         if cached:
             # 缓存有 verdict，重新查询 DB 获取最新 history/snapshots/evolution
             conn = get_connection()
-            history_rows_raw = conn.execute(
-                "SELECT * FROM verdict_history ORDER BY created_at DESC LIMIT 50"
-            ).fetchall()
-            history_rows = []
-            for r in history_rows_raw:
-                history_rows.append({
-                    "regime": r["regime"], "direction": r["direction"],
-                    "strength": r["strength"], "confidence": r["confidence"],
-                    "momentum": r["momentum"], "advice": r["advice"],
-                    "price": r["price"], "adx_4h": r["adx_4h"], "adx_1h": r["adx_1h"],
-                    "dir_4h": r["dir_4h"], "dir_1h": r["dir_1h"],
-                    "created_at": r["created_at"],
-                })
+            try:
+                history_rows_raw = conn.execute(
+                    "SELECT * FROM verdict_history ORDER BY created_at DESC LIMIT 50"
+                ).fetchall()
+                history_rows = []
+                for r in history_rows_raw:
+                    history_rows.append({
+                        "regime": r["regime"], "direction": r["direction"],
+                        "strength": r["strength"], "confidence": r["confidence"],
+                        "momentum": r["momentum"], "advice": r["advice"],
+                        "price": r["price"], "adx_4h": r["adx_4h"], "adx_1h": r["adx_1h"],
+                        "dir_4h": r["dir_4h"], "dir_1h": r["dir_1h"],
+                        "created_at": r["created_at"],
+                    })
 
-            verdict_history = []
-            for r in history_rows:
-                dt = datetime.fromtimestamp(r.get("created_at", time.time())).strftime("%m-%d %H:%M")
-                verdict_history.append({**r, "time": dt})
-            # 连续相同去重
-            deduped = []
-            for h in verdict_history:
-                if not deduped or deduped[-1]["regime"] != h["regime"] or deduped[-1]["direction"] != h["direction"]:
-                    deduped.append(h)
-            verdict_history = deduped
+                verdict_history = []
+                for r in history_rows:
+                    dt = datetime.fromtimestamp(r.get("created_at", time.time())).strftime("%m-%d %H:%M")
+                    verdict_history.append({**r, "time": dt})
+                # 连续相同去重
+                deduped = []
+                for h in verdict_history:
+                    if not deduped or deduped[-1]["regime"] != h["regime"] or deduped[-1]["direction"] != h["direction"]:
+                        deduped.append(h)
+                verdict_history = deduped
 
-            snapshots = conn.execute(
-                "SELECT regime, direction, adx, plus_di, minus_di, price_at_signal, created_at "
-                "FROM signals WHERE timeframe = '30m' ORDER BY created_at DESC LIMIT 10"
-            ).fetchall()
-            m30_snapshots = []
-            for s in snapshots:
-                dt = datetime.fromtimestamp(s["created_at"]).strftime("%H:%M:%S")
-                m30_snapshots.append({
-                    "ts": s["created_at"], "time": dt,
-                    "price": s["price_at_signal"], "adx": s["adx"],
-                    "plus_di": s["plus_di"], "minus_di": s["minus_di"],
-                    "regime": s["regime"], "direction": s["direction"],
-                })
+                snapshots = conn.execute(
+                    "SELECT regime, direction, adx, plus_di, minus_di, price_at_signal, created_at "
+                    "FROM signals WHERE timeframe = '30m' ORDER BY created_at DESC LIMIT 10"
+                ).fetchall()
+                m30_snapshots = []
+                for s in snapshots:
+                    dt = datetime.fromtimestamp(s["created_at"]).strftime("%H:%M:%S")
+                    m30_snapshots.append({
+                        "ts": s["created_at"], "time": dt,
+                        "price": s["price_at_signal"], "adx": s["adx"],
+                        "plus_di": s["plus_di"], "minus_di": s["minus_di"],
+                        "regime": s["regime"], "direction": s["direction"],
+                    })
 
-            # Get open position for state machine (manual only)
-            open_position = conn.execute(
-                "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 0 ORDER BY created_at DESC LIMIT 1"
-            ).fetchone()
-            position_dict = dict(open_position) if open_position else None
+                # Get open position for state machine (manual only)
+                open_position = conn.execute(
+                    "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 0 ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
+                position_dict = dict(open_position) if open_position else None
 
-            # Query simulated position for response
-            sim_row = conn.execute(
-                "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 1 ORDER BY created_at DESC LIMIT 1"
-            ).fetchone()
+                # Deep-copy cached data and manage positions while connection is open
+                data = copy.deepcopy(cached["data"])
+                manage_simulated_position(conn, data, data["ticker"]["price"])
 
-            conn.close()
+                # Re-query simulated position since management may have changed it
+                sim_row = conn.execute(
+                    "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 1 ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
 
-            data = copy.deepcopy(cached["data"])
-            data["verdict_history"] = verdict_history
-            data["m30_snapshots"] = m30_snapshots
-            data["timestamp"] = datetime.now().isoformat()
-            data["evolution"] = _build_evolution()
-            data["simulated_position"] = dict(sim_row) if sim_row else None
+                # Evolution uses same conn (avoids extra DB open/close)
+                evolution_data = _build_evolution(conn)
 
-            # Reload per-TF base thresholds after evolution may have adjusted them
-            ev_params = get_active_thresholds()
-            tf_cfg = ev_params.get("tf_thresholds", {})
-            vol_adj_factor = ev_params.get("vol_adjustment_factor", 0.1)
-            for tf_key in ["30m", "1h", "4h"]:
-                tf_base = tf_cfg.get(tf_key, {})
-                base_t = tf_base.get("adx_trending_threshold", ev_params["adx_trending_threshold"])
-                base_f = tf_base.get("adx_forming_threshold", ev_params["adx_forming_threshold"])
-                tf_data = data.get("verdict", {}).get("timeframes", {}).get(tf_key, {})
-                vol_pct = tf_data.get("vol_percentile", 50)
-                t_adj = max(-5, min(5, (vol_pct - 50) * vol_adj_factor))
-                f_adj = max(-3, min(3, (vol_pct - 50) * vol_adj_factor * 0.6))
-                tf_data["base_trending"] = base_t
-                tf_data["base_forming"] = base_f
-                tf_data["trending_adj"] = round(t_adj, 1)
-                tf_data["forming_adj"] = round(f_adj, 1)
-                tf_data["effective_trending"] = round(min(base_t + t_adj, 34), 1)
-                tf_data["effective_forming"] = round(min(base_f + f_adj, 28), 1)
+                data["verdict_history"] = verdict_history
+                data["m30_snapshots"] = m30_snapshots
+                data["timestamp"] = datetime.now().isoformat()
+                data["evolution"] = evolution_data
+                data["simulated_position"] = dict(sim_row) if sim_row else None
 
-            # 更新实时价格
-            _refresh_live_prices(data)
+                # Reload per-TF base thresholds after evolution may have adjusted them
+                ev_params = get_active_thresholds()
+                tf_cfg = ev_params.get("tf_thresholds", {})
+                vol_adj_factor = ev_params.get("vol_adjustment_factor", 0.1)
+                for tf_key in ["30m", "1h", "4h"]:
+                    tf_base = tf_cfg.get(tf_key, {})
+                    base_t = tf_base.get("adx_trending_threshold", ev_params["adx_trending_threshold"])
+                    base_f = tf_base.get("adx_forming_threshold", ev_params["adx_forming_threshold"])
+                    tf_data = data.get("verdict", {}).get("timeframes", {}).get(tf_key, {})
+                    vol_pct = tf_data.get("vol_percentile", 50)
+                    t_adj = max(-5, min(5, (vol_pct - 50) * vol_adj_factor))
+                    f_adj = max(-3, min(3, (vol_pct - 50) * vol_adj_factor * 0.6))
+                    tf_data["base_trending"] = base_t
+                    tf_data["base_forming"] = base_f
+                    tf_data["trending_adj"] = round(t_adj, 1)
+                    tf_data["forming_adj"] = round(f_adj, 1)
+                    tf_data["effective_trending"] = round(min(base_t + t_adj, 34), 1)
+                    tf_data["effective_forming"] = round(min(base_f + f_adj, 28), 1)
+
+                # 更新实时价格
+                _refresh_live_prices(data)
+            finally:
+                conn.close()
             return data
 
     # 缓存过期或强制刷新，调用 Binance
     conn = get_connection()
+    try:
 
-    # Query history rows and open position BEFORE generating verdict
-    history_rows_raw = conn.execute(
-        "SELECT * FROM verdict_history ORDER BY created_at DESC LIMIT 300"
-    ).fetchall()
-    history_rows = []
-    for r in history_rows_raw:
-        history_rows.append({
-            "regime": r["regime"], "direction": r["direction"],
-            "strength": r["strength"], "confidence": r["confidence"],
-            "momentum": r["momentum"], "advice": r["advice"],
-            "price": r["price"], "adx_4h": r["adx_4h"], "adx_1h": r["adx_1h"],
-            "dir_4h": r["dir_4h"], "dir_1h": r["dir_1h"],
-            "created_at": r["created_at"],
-        })
-
-    open_position = conn.execute(
-        "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 0 ORDER BY created_at DESC LIMIT 1"
-    ).fetchone()
-    position_dict = dict(open_position) if open_position else None
-
-    if now is None:
-        now = time.time()
-
-    # Fetch all market data in parallel (klines + funding + OI)
-    # Use different limits per TF — vol_percentile needs ~5-7 days of data
-    market_data = fetch_all_market_data(
-        settings.binance_symbol,
-        timeframes=["30m", "1h", "4h"],
-        limits={"30m": 200, "1h": 200, "4h": 100},
-    )
-    funding_rate = market_data.get("funding_rate", 0.0)
-    current_oi = market_data.get("open_interest", 0.0)
-    prev_oi = market_data.get("open_interest_prev", 0.0)
-
-    # Recent price history for OI divergence detection
-    price_candles = market_data.get("klines_4h", [])[:6]
-    price_history = [c["close"] for c in price_candles] if price_candles else []
-
-    # Exhaustion reversal cooling: check if a reversal signal was recently emitted
-    last_reversal_row = conn.execute(
-        "SELECT created_at, direction FROM signals "
-        "WHERE signal_type = 'exhaustion_reversal' ORDER BY created_at DESC LIMIT 3"
-    ).fetchall()
-    recent_reversals = [
-        {"created_at": r["created_at"], "direction": r["direction"]} for r in last_reversal_row
-    ]
-
-    # P3 ranging breakout / macro bias cooldown: track recent signals
-    last_p3_row = conn.execute(
-        "SELECT created_at, direction, signal_type FROM signals "
-        "WHERE signal_type IN ('ranging_breakout', 'macro_bias_long') "
-        "ORDER BY created_at DESC LIMIT 5"
-    ).fetchall()
-    recent_p3_signals = [
-        {"created_at": r["created_at"], "direction": r["direction"], "signal_type": r["signal_type"]}
-        for r in last_p3_row
-    ]
-
-    # Aggressive signal cooldowns: track recent aggressive signal timestamps
-    from app.signal_engine import AGGRESSIVE_COOLDOWNS
-    last_agg_row = conn.execute(
-        "SELECT created_at, signal_type FROM signals "
-        "WHERE signal_type LIKE 'aggressive_%' OR signal_type IN ('double_top', 'double_bottom') "
-        "ORDER BY created_at DESC LIMIT 20"
-    ).fetchall()
-    now_ts = time.time()
-    aggressive_cooldowns = {}
-    for r in last_agg_row:
-        stype = r["signal_type"]
-        if stype in AGGRESSIVE_COOLDOWNS:
-            elapsed = now_ts - r["created_at"]
-            if elapsed < AGGRESSIVE_COOLDOWNS[stype]:
-                aggressive_cooldowns[stype] = True
-
-    # Track last active aggressive signal (for sticky persistence):
-    # double_top/double_bottom are persistent patterns; volume_spike is transient.
-    last_aggressive = None
-    for r in last_agg_row:
-        stype = r["signal_type"]
-        if stype in ("double_top", "double_bottom"):
-            agg_key = "aggressive_pattern_breakout"
-        elif stype.startswith("aggressive_"):
-            agg_key = stype
-        else:
-            continue
-        elapsed = now_ts - r["created_at"]
-        if elapsed < AGGRESSIVE_COOLDOWNS.get(agg_key, 7200):
-            is_persistent = agg_key in ("aggressive_pattern_breakout", "aggressive_squeeze_breakout")
-            last_aggressive = f"{agg_key},{is_persistent}"
-            break
-
-    market_ctx = {
-        "funding_rate": funding_rate,
-        "open_interest": current_oi,
-        "open_interest_prev": prev_oi,
-        "price_history": price_history,
-        "recent_reversals": recent_reversals,
-        "recent_p3_signals": recent_p3_signals,
-        "aggressive_cooldowns": aggressive_cooldowns,
-        "last_aggressive_signal": last_aggressive,
-    }
-
-    data = generate_verdict(
-        history_rows=history_rows,
-        position=position_dict,
-        market_context=market_ctx,
-        pre_fetched_klines={
-            "30m": market_data.get("klines_30m", []),
-            "1h": market_data.get("klines_1h", []),
-            "4h": market_data.get("klines_4h", []),
-        },
-    )
-    latest_signals = {}
-    for tf in data["timeframes"]:
-        row = conn.execute(
-            "SELECT regime, direction, verdict, action FROM signals "
-            "WHERE timeframe = ? ORDER BY created_at DESC LIMIT 1",
-            (tf,),
+        # Query history rows and open position BEFORE generating verdict
+        history_rows_raw = conn.execute(
+            "SELECT * FROM verdict_history ORDER BY created_at DESC LIMIT 300"
+        ).fetchall()
+        history_rows = []
+        for r in history_rows_raw:
+            history_rows.append({
+                "regime": r["regime"], "direction": r["direction"],
+                "strength": r["strength"], "confidence": r["confidence"],
+                "momentum": r["momentum"], "advice": r["advice"],
+                "price": r["price"], "adx_4h": r["adx_4h"], "adx_1h": r["adx_1h"],
+                "dir_4h": r["dir_4h"], "dir_1h": r["dir_1h"],
+                "created_at": r["created_at"],
+            })
+    
+        open_position = conn.execute(
+            "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 0 ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
-        if row:
-            latest_signals[tf] = (row["regime"], row["direction"], row["verdict"], row["action"])
-
-    signal_changed = False
-    # Per-TF candle cooldown: prevent duplicate signals within same candle window.
-    CANDLE_SECONDS = {"30m": 1800, "1h": 3600, "4h": 14400}
-    for tf, tf_data in data["timeframes"].items():
-        prev = latest_signals.get(tf)
-        new_sig = (tf_data["regime"], tf_data["direction"], data["verdict"]["direction"], data["verdict"]["advice"]["action"])
-        if prev is None or prev != new_sig:
-            # Check if a signal was already created in the current candle period
-            tf_seconds = CANDLE_SECONDS.get(tf, 3600)
-            candle_start = now - (now % tf_seconds)
-            existing = conn.execute(
-                "SELECT id FROM signals WHERE timeframe = ? AND created_at >= ? LIMIT 1",
-                (tf, candle_start),
+        position_dict = dict(open_position) if open_position else None
+    
+        if now is None:
+            now = time.time()
+    
+        # Fetch all market data in parallel (klines + funding + OI)
+        # Use different limits per TF — vol_percentile needs ~5-7 days of data
+        market_data = fetch_all_market_data(
+            settings.binance_symbol,
+            timeframes=["30m", "1h", "4h"],
+            limits={"30m": 200, "1h": 200, "4h": 100},
+        )
+        funding_rate = market_data.get("funding_rate", 0.0)
+        current_oi = market_data.get("open_interest", 0.0)
+        prev_oi = market_data.get("open_interest_prev", 0.0)
+    
+        # Recent price history for OI divergence detection
+        price_candles = market_data.get("klines_4h", [])[:6]
+        price_history = [c["close"] for c in price_candles] if price_candles else []
+    
+        # Exhaustion reversal cooling: check if a reversal signal was recently emitted
+        last_reversal_row = conn.execute(
+            "SELECT created_at, direction FROM signals "
+            "WHERE signal_type = 'exhaustion_reversal' ORDER BY created_at DESC LIMIT 3"
+        ).fetchall()
+        recent_reversals = [
+            {"created_at": r["created_at"], "direction": r["direction"]} for r in last_reversal_row
+        ]
+    
+        # P3 ranging breakout / macro bias cooldown: track recent signals
+        last_p3_row = conn.execute(
+            "SELECT created_at, direction, signal_type FROM signals "
+            "WHERE signal_type IN ('ranging_breakout', 'macro_bias_long') "
+            "ORDER BY created_at DESC LIMIT 5"
+        ).fetchall()
+        recent_p3_signals = [
+            {"created_at": r["created_at"], "direction": r["direction"], "signal_type": r["signal_type"]}
+            for r in last_p3_row
+        ]
+    
+        # Aggressive signal cooldowns: track recent aggressive signal timestamps
+        from app.signal_engine import AGGRESSIVE_COOLDOWNS
+        last_agg_row = conn.execute(
+            "SELECT created_at, signal_type FROM signals "
+            "WHERE signal_type LIKE 'aggressive_%' OR signal_type IN ('double_top', 'double_bottom') "
+            "ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+        now_ts = time.time()
+        aggressive_cooldowns = {}
+        for r in last_agg_row:
+            stype = r["signal_type"]
+            if stype in AGGRESSIVE_COOLDOWNS:
+                elapsed = now_ts - r["created_at"]
+                if elapsed < AGGRESSIVE_COOLDOWNS[stype]:
+                    aggressive_cooldowns[stype] = True
+    
+        # Track last active aggressive signal (for sticky persistence):
+        # double_top/double_bottom are persistent patterns; volume_spike is transient.
+        last_aggressive = None
+        for r in last_agg_row:
+            stype = r["signal_type"]
+            if stype in ("double_top", "double_bottom"):
+                agg_key = "aggressive_pattern_breakout"
+            elif stype.startswith("aggressive_"):
+                agg_key = stype
+            else:
+                continue
+            elapsed = now_ts - r["created_at"]
+            if elapsed < AGGRESSIVE_COOLDOWNS.get(agg_key, 7200):
+                is_persistent = agg_key in ("aggressive_pattern_breakout", "aggressive_squeeze_breakout")
+                last_aggressive = f"{agg_key},{is_persistent}"
+                break
+    
+        market_ctx = {
+            "funding_rate": funding_rate,
+            "open_interest": current_oi,
+            "open_interest_prev": prev_oi,
+            "price_history": price_history,
+            "recent_reversals": recent_reversals,
+            "recent_p3_signals": recent_p3_signals,
+            "aggressive_cooldowns": aggressive_cooldowns,
+            "last_aggressive_signal": last_aggressive,
+        }
+    
+        data = generate_verdict(
+            history_rows=history_rows,
+            position=position_dict,
+            market_context=market_ctx,
+            pre_fetched_klines={
+                "30m": market_data.get("klines_30m", []),
+                "1h": market_data.get("klines_1h", []),
+                "4h": market_data.get("klines_4h", []),
+            },
+        )
+        latest_signals = {}
+        for tf in data["timeframes"]:
+            row = conn.execute(
+                "SELECT regime, direction, verdict, action FROM signals "
+                "WHERE timeframe = ? ORDER BY created_at DESC LIMIT 1",
+                (tf,),
             ).fetchone()
-            if existing:
-                continue  # Skip: already have a signal for this candle
-            signal_changed = True
+            if row:
+                latest_signals[tf] = (row["regime"], row["direction"], row["verdict"], row["action"])
+    
+        signal_changed = False
+        # Per-TF candle cooldown: prevent duplicate signals within same candle window.
+        CANDLE_SECONDS = {"30m": 1800, "1h": 3600, "4h": 14400}
+        for tf, tf_data in data["timeframes"].items():
+            prev = latest_signals.get(tf)
+            new_sig = (tf_data["regime"], tf_data["direction"], data["verdict"]["direction"], data["verdict"]["advice"]["action"])
+            if prev is None or prev != new_sig:
+                # Check if a signal was already created in the current candle period
+                tf_seconds = CANDLE_SECONDS.get(tf, 3600)
+                candle_start = now - (now % tf_seconds)
+                existing = conn.execute(
+                    "SELECT id FROM signals WHERE timeframe = ? AND created_at >= ? LIMIT 1",
+                    (tf, candle_start),
+                ).fetchone()
+                if existing:
+                    continue  # Skip: already have a signal for this candle
+                signal_changed = True
+                conn.execute(
+                    "INSERT INTO signals (timeframe, regime, direction, adx, plus_di, minus_di, "
+                    "confidence, strength, momentum, duration_hours, price_at_signal, "
+                    "verdict, action, target, stop, signal_type, created_at, verified) VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    (
+                        tf, tf_data["regime"], tf_data["direction"], tf_data["adx"],
+                        tf_data["plus_di"], tf_data["minus_di"], tf_data["confidence"],
+                        tf_data.get("strength"), tf_data.get("momentum"),
+                        tf_data.get("duration_hours"), tf_data["price"],
+                        data["verdict"]["direction"],
+                        data["verdict"]["advice"]["action"],
+                        data["verdict"]["advice"]["target"],
+                        data["verdict"]["advice"]["stop"],
+                        tf_data.get("signal_type", "trend_following"),
+                        now,
+                    ),
+                )
+    
+        if signal_changed:
             conn.execute(
-                "INSERT INTO signals (timeframe, regime, direction, adx, plus_di, minus_di, "
-                "confidence, strength, momentum, duration_hours, price_at_signal, "
-                "verdict, action, target, stop, signal_type, created_at, verified) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                "INSERT INTO verdict_history (regime, direction, strength, confidence, "
+                "momentum, advice, price, adx_4h, adx_1h, dir_4h, dir_1h, created_at) VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    tf, tf_data["regime"], tf_data["direction"], tf_data["adx"],
-                    tf_data["plus_di"], tf_data["minus_di"], tf_data["confidence"],
-                    tf_data.get("strength"), tf_data.get("momentum"),
-                    tf_data.get("duration_hours"), tf_data["price"],
-                    data["verdict"]["direction"],
-                    data["verdict"]["advice"]["action"],
-                    data["verdict"]["advice"]["target"],
-                    data["verdict"]["advice"]["stop"],
-                    tf_data.get("signal_type", "trend_following"),
+                    data["verdict"]["regime"], data["verdict"]["direction"],
+                    data["verdict"]["strength"], data["verdict"]["confidence"],
+                    data["verdict"]["momentum"], data["verdict"]["advice"]["action"],
+                    data["ticker"]["price"],
+                    data["timeframes"]["4h"]["adx"],
+                    data["timeframes"]["1h"]["adx"],
+                    data["timeframes"]["4h"]["direction"],
+                    data["timeframes"]["1h"]["direction"],
                     now,
                 ),
             )
+        conn.commit()
+    
+        history_rows = conn.execute(
+            "SELECT * FROM verdict_history ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+        verdict_history = []
+        for r in history_rows:
+            dt = datetime.fromtimestamp(r["created_at"]).strftime("%m-%d %H:%M")
+            verdict_history.append({
+                "time": dt, "regime": r["regime"], "direction": r["direction"],
+                "strength": r["strength"], "confidence": r["confidence"],
+                "momentum": r["momentum"], "advice": r["advice"],
+                "price": r["price"], "adx_4h": r["adx_4h"], "adx_1h": r["adx_1h"],
+                "dir_4h": r["dir_4h"], "dir_1h": r["dir_1h"],
+            })
+        deduped = []
+        for h in verdict_history:
+            if not deduped or deduped[-1]["regime"] != h["regime"] or deduped[-1]["direction"] != h["direction"]:
+                deduped.append(h)
+        verdict_history = deduped
+    
+        snapshots = conn.execute(
+            "SELECT regime, direction, adx, plus_di, minus_di, price_at_signal, created_at "
+            "FROM signals WHERE timeframe = '30m' ORDER BY created_at DESC LIMIT 10"
+        ).fetchall()
+        m30_snapshots = []
+        for s in snapshots:
+            dt = datetime.fromtimestamp(s["created_at"]).strftime("%H:%M:%S")
+            m30_snapshots.append({
+                "ts": s["created_at"], "time": dt,
+                "price": s["price_at_signal"], "adx": s["adx"],
+                "plus_di": s["plus_di"], "minus_di": s["minus_di"],
+                "regime": s["regime"], "direction": s["direction"],
+            })
+    
+        data["verdict_history"] = verdict_history
+        data["m30_snapshots"] = m30_snapshots
+        data["timestamp"] = datetime.now().isoformat()
+        data["verdict"]["price_at_signal"] = data["ticker"]["price"]
+        data["evolution"] = _build_evolution(conn)
+    
+        # Manage simulated positions
+        manage_simulated_position(conn, data, data["ticker"]["price"])
+    
+        # 同步实时价格，确保 ticker.price 和 timeframes['30m'].price 一致
+        _refresh_live_prices(data)
+    
+        # Query simulated position for response
+        sim_row = conn.execute(
+            "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 1 ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        data["simulated_position"] = dict(sim_row) if sim_row else None
 
-    if signal_changed:
-        conn.execute(
-            "INSERT INTO verdict_history (regime, direction, strength, confidence, "
-            "momentum, advice, price, adx_4h, adx_1h, dir_4h, dir_1h, created_at) VALUES "
-            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                data["verdict"]["regime"], data["verdict"]["direction"],
-                data["verdict"]["strength"], data["verdict"]["confidence"],
-                data["verdict"]["momentum"], data["verdict"]["advice"]["action"],
-                data["ticker"]["price"],
-                data["timeframes"]["4h"]["adx"],
-                data["timeframes"]["1h"]["adx"],
-                data["timeframes"]["4h"]["direction"],
-                data["timeframes"]["1h"]["direction"],
-                now,
-            ),
-        )
-    conn.commit()
-
-    history_rows = conn.execute(
-        "SELECT * FROM verdict_history ORDER BY created_at DESC LIMIT 50"
-    ).fetchall()
-    verdict_history = []
-    for r in history_rows:
-        dt = datetime.fromtimestamp(r["created_at"]).strftime("%m-%d %H:%M")
-        verdict_history.append({
-            "time": dt, "regime": r["regime"], "direction": r["direction"],
-            "strength": r["strength"], "confidence": r["confidence"],
-            "momentum": r["momentum"], "advice": r["advice"],
-            "price": r["price"], "adx_4h": r["adx_4h"], "adx_1h": r["adx_1h"],
-            "dir_4h": r["dir_4h"], "dir_1h": r["dir_1h"],
-        })
-    deduped = []
-    for h in verdict_history:
-        if not deduped or deduped[-1]["regime"] != h["regime"] or deduped[-1]["direction"] != h["direction"]:
-            deduped.append(h)
-    verdict_history = deduped
-
-    snapshots = conn.execute(
-        "SELECT regime, direction, adx, plus_di, minus_di, price_at_signal, created_at "
-        "FROM signals WHERE timeframe = '30m' ORDER BY created_at DESC LIMIT 10"
-    ).fetchall()
-    m30_snapshots = []
-    for s in snapshots:
-        dt = datetime.fromtimestamp(s["created_at"]).strftime("%H:%M:%S")
-        m30_snapshots.append({
-            "ts": s["created_at"], "time": dt,
-            "price": s["price_at_signal"], "adx": s["adx"],
-            "plus_di": s["plus_di"], "minus_di": s["minus_di"],
-            "regime": s["regime"], "direction": s["direction"],
-        })
-
-    data["verdict_history"] = verdict_history
-    data["m30_snapshots"] = m30_snapshots
-    data["timestamp"] = datetime.now().isoformat()
-    data["verdict"]["price_at_signal"] = data["ticker"]["price"]
-    data["evolution"] = _build_evolution()
-
-    # Manage simulated positions
-    manage_simulated_position(conn, data, data["ticker"]["price"])
-
-    # 同步实时价格，确保 ticker.price 和 timeframes['30m'].price 一致
-    _refresh_live_prices(data)
-
-    # Query simulated position for response
-    sim_row = conn.execute(
-        "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 1 ORDER BY created_at DESC LIMIT 1"
-    ).fetchone()
-    data["simulated_position"] = dict(sim_row) if sim_row else None
-
-    # 写入缓存
-    _set_cached_signals({"data": data})
-    conn.close()
+        # 写入缓存
+        _set_cached_signals({"data": data})
+    finally:
+        conn.close()
     return data
 
 
-def _build_evolution() -> dict:
-    """Build evolution stats with pending signal verification."""
-    verify_pending_signals()
-    return get_evolution_stats()
+def _build_evolution(conn=None) -> dict:
+    """Build evolution stats with pending signal verification (only if pending)."""
+    own_conn = False
+    if conn is None:
+        conn = get_connection()
+        own_conn = True
+
+    # Quick check: only fetch klines when there are actually pending signals
+    pending = conn.execute(
+        "SELECT COUNT(*) as cnt FROM signals WHERE verified = 0"
+    ).fetchone()
+    if pending and pending["cnt"] > 0:
+        verify_pending_signals()
+
+    result = get_evolution_stats()
+
+    if own_conn:
+        conn.close()
+    return result
 
 
 # ---------- API ----------
@@ -572,9 +613,22 @@ async def api_close_position(position_id: int, request: Request):
     if row["hl_enabled"]:
         hl_result = hl_close_position(row.get("hl_sz"))
 
+    now = time.time()
+    current_price = fetch_price(settings.binance_symbol) or row["entry_price"]
+    updates: dict = {"status": "closed", "updated_at": now, "closed_at": now, "close_price": current_price}
+
+    if row["is_simulated"]:
+        # Calculate PnL for simulated positions
+        entry = row["entry_price"]
+        pct = (current_price - entry) / entry
+        if row["side"] == "short":
+            pct = -pct
+        pnl = pct * (row["position_size"] * entry)  # notional * price change
+        updates["pnl"] = round(pnl, 2)
+
     conn.execute(
-        "UPDATE positions SET status = 'closed', updated_at = ? WHERE id = ?",
-        (time.time(), position_id),
+        "UPDATE positions SET status=?, updated_at=?, closed_at=?, close_price=?, pnl=? WHERE id=?",
+        (updates["status"], updates["updated_at"], updates["closed_at"], updates["close_price"], updates.get("pnl"), position_id),
     )
     conn.commit()
     conn.close()
@@ -634,8 +688,7 @@ async def api_record_action(position_id: int, request: Request):
 async def api_evolution(request: Request):
     if not require_auth(request):
         return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
-    verify_pending_signals()
-    return get_evolution_stats()
+    return _build_evolution()
 
 
 @app.get("/api/position/simulated")

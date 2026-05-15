@@ -12,10 +12,10 @@
   "vol_adjustment_factor": 0.1,
   "atr_stop_multiplier": 2.2,
   "rr_ratio": 1.5,
-  "last_updated": 1778791545.7585568,
+  "last_updated": 1778877415.064786,
   "tf_thresholds": {
     "30m": {
-      "adx_trending_threshold": 24.5,
+      "adx_trending_threshold": 28,
       "adx_forming_threshold": 15,
       "adx_period": 14,
       "adx_fast_period": 10,
@@ -24,8 +24,8 @@
       "unreliable": false
     },
     "1h": {
-      "adx_trending_threshold": 28,
-      "adx_forming_threshold": 24.0,
+      "adx_trending_threshold": 27.5,
+      "adx_forming_threshold": 20.5,
       "adx_period": 14,
       "adx_fast_period": 10,
       "adx_slow_period": 21,
@@ -33,8 +33,8 @@
       "unreliable": false
     },
     "4h": {
-      "adx_trending_threshold": 26.5,
-      "adx_forming_threshold": 19,
+      "adx_trending_threshold": 28,
+      "adx_forming_threshold": 21,
       "adx_period": 10,
       "adx_fast_period": 7,
       "adx_slow_period": 14,
@@ -43,8 +43,8 @@
     }
   },
   "last_verified_counts": {
-    "30m": 23,
-    "1h": 13,
-    "4h": 3
+    "30m": 42,
+    "1h": 22,
+    "4h": 9
   }
 }

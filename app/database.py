@@ -203,8 +203,34 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # column already exists
 
-    # Create default user
-    pw_hash = hashlib.sha256(settings.password.encode()).hexdigest()
+    # Signal type tracking on positions — enables signal-type-specific exit logic
+    # and accurate evolution tracking per signal type
+    try:
+        c.execute("ALTER TABLE positions ADD COLUMN signal_type TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # Bug fix: max_price/min_price for accurate add-on price-extreme detection.
+    # Without these, _is_price_extreme falls back to entry_price, treating any
+    # minor breakout as a "new extreme" even after a significant pullback.
+    for col_sql in [
+        "ALTER TABLE positions ADD COLUMN max_price REAL",
+        "ALTER TABLE positions ADD COLUMN min_price REAL",
+    ]:
+        try:
+            c.execute(col_sql)
+        except sqlite3.OperationalError:
+            pass
+
+    # Backfill max_price/min_price for existing open positions from entry_price
+    c.execute(
+        "UPDATE positions SET max_price = entry_price, min_price = entry_price "
+        "WHERE max_price IS NULL OR min_price IS NULL"
+    )
+
+    # Create default user (use salted hash from auth module)
+    from app.auth import hash_password
+    pw_hash = hash_password(settings.password)
     try:
         c.execute(
             "INSERT INTO users (username, password_hash) VALUES (?, ?)",
@@ -212,6 +238,16 @@ def init_db():
         )
     except sqlite3.IntegrityError:
         pass
+
+    # Migrate existing unsalted password hashes to salted
+    # Unsalted SHA256 is 64 hex chars; salted uses a different value since
+    # the salt is session-secret-dependent, so any stale hash won't match.
+    # Force password reset by replacing known default hash with salted version.
+    old_default_hash = hashlib.sha256("trad2026".encode()).hexdigest()
+    c.execute(
+        "UPDATE users SET password_hash = ? WHERE password_hash = ?",
+        (pw_hash, old_default_hash),
+    )
 
     conn.commit()
     conn.close()

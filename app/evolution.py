@@ -15,14 +15,28 @@ from app.binance import fetch_klines
 from app.config import settings
 
 # Verification: how many candles AFTER the signal candle to check.
-# Extended from 2→3 to give trends enough time to develop.
-# 30m: 3 candles = 1.5h (was 1h — too short to confirm)
-# 1h:  3 candles = 3h  (was 2h — forming signals especially need more time)
-# 4h:  3 candles = 12h (was 8h — borderline for breakout confirmation)
-VERIFY_CANDLES = {
+# Differentiated by signal type: slow strategies (trending, forming) need more
+# candles; fast strategies (breakout, reversal) need fewer.
+# The verify function uses VERIFY_CANDLES_DEFAULT as the base, and overrides
+# for specific signal types.
+VERIFY_CANDLES_DEFAULT = {
+    "30m": 4,  # extended from 3 → 4 (2h) for better confirmation
+    "1h": 4,   # extended from 3 → 4 (4h) — forming signals especially need time
+    "4h": 4,   # extended from 3 → 4 (16h) — breakout confirmation window
+}
+
+# Fast signals (breakout, reversal) — shorter window is sufficient
+VERIFY_CANDLES_FAST = {
     "30m": 3,
     "1h": 3,
     "4h": 3,
+}
+
+# Slow signals (trending, forming) — need longer window
+VERIFY_CANDLES_SLOW = {
+    "30m": 6,
+    "1h": 6,
+    "4h": 5,
 }
 
 # Evolution state file path
@@ -126,16 +140,21 @@ def _find_signal_candle(candles: list, created_at: float):
     return best_idx
 
 
-def verify_pending_signals():
+def verify_pending_signals(conn=None):
     """Check pending signals and verify them against actual market behavior.
 
     Uses timestamp-based candle matching (not price matching) to find
     the exact signal candle, then verifies the NEXT N candles.
+
+    Args:
+        conn: optional shared DB connection. If not provided, creates its own.
     """
-    conn = get_connection()
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
     now = time.time()
 
-    for tf, _ in VERIFY_CANDLES.items():
+    for tf, _ in VERIFY_CANDLES_DEFAULT.items():
         rows = conn.execute(
             "SELECT id, timeframe, direction, price_at_signal, adx, regime, "
             "momentum, target, stop, created_at, signal_type "
@@ -165,24 +184,24 @@ def verify_pending_signals():
             # Find signal candle by timestamp matching
             signal_idx = _find_signal_candle(candles, created_at)
             if signal_idx is None:
-                continue
-
-            # Validate: matched candle must be within 1.5 candle intervals of signal time.
-            # If the signal is older than the 200-candle window, skip it.
-            candle_seconds = {"30m": 1800, "1h": 3600, "4h": 14400}
-            max_age = candle_seconds.get(tf, 3600) * 1.5
-            time_diff = created_at - candles[signal_idx]["timestamp"]
-            if time_diff > max_age:
-                # Signal is outside the 200-candle window — can't verify accurately.
-                # Mark as unverifiable (excluded from accuracy stats) instead of
-                # silently marking as verified which would pull down accuracy.
+                # Signal is outside the 200-candle window — can't find the candle.
+                # Mark as unverifiable (excluded from accuracy stats) to prevent
+                # infinite retry loops.
                 conn.execute(
                     "UPDATE signals SET verified = 1, unverifiable = 1 WHERE id = ?", (sig_id,)
                 )
                 continue
 
-            # Verify the NEXT N candles after the signal candle
-            n_verify = VERIFY_CANDLES[tf]
+            # Select verify window based on signal type — slow strategies need
+            # more candles, fast strategies are confirmed quickly.
+            signal_type_for_window = dict(row).get("signal_type") or ""
+            if signal_type_for_window in ("ranging_breakout", "exhaustion_reversal", "aggressive_adx7_early", "trend_forming_early"):
+                n_verify = VERIFY_CANDLES_FAST.get(tf, 3)
+            elif signal_type_for_window in ("trend_following", "trend_pullback", "macro_bias_long", "trend_exhaustion", "trend_exhaustion_block", "low_vol_trend") or signal_type_for_window.startswith("stage1_"):
+                n_verify = VERIFY_CANDLES_SLOW.get(tf, 6)
+            else:
+                n_verify = VERIFY_CANDLES_DEFAULT.get(tf, 4)
+
             verify_start = signal_idx + 1
             verify_end = min(verify_start + n_verify, len(candles))
 
@@ -208,18 +227,35 @@ def verify_pending_signals():
             # Avoids fixed-percentage bias across volatility regimes.
             from app.indicators import calc_atr, calc_adx as calc_adx_func
             from app.evolution import _load_evolution_params
+            regime_at_signal = row["regime"]
+
+            # ATR and ADX should be calculated up to the verification window,
+            # not the current 200-candle end. Using all 200 candles means recent
+            # price action dominates the indicator, making verification of old
+            # signals inaccurate. Slice to the verification end point.
+            verify_limit = verify_end  # include candles up through verification window
+            highs_window = [c["high"] for c in candles[:verify_limit]]
+            lows_window = [c["low"] for c in candles[:verify_limit]]
+            closes_window = [c["close"] for c in candles[:verify_limit]]
+
+            # Full 200-candle data for signal-engine comparison (ADX at signal time)
             highs_all = [c["high"] for c in candles]
             lows_all = [c["low"] for c in candles]
             closes_all = [c["close"] for c in candles]
-            regime_at_signal = row["regime"]
 
             # Per-TF ADX period for verification consistency
             evol_params = _load_evolution_params()
             tf_cfg = evol_params.get("tf_thresholds", {}).get(tf, {})
             adx_verify_period = tf_cfg.get("adx_period", 14)
 
-            atr_value = calc_atr(highs_all, lows_all, closes_all, period=14)
-            atr_pct_price = (atr_value / max(price_at_signal, 1)) * 100
+            # ADX over the verification window — reflects volatility at signal time
+            if len(highs_window) >= 29:
+                atr_value = calc_atr(highs_window, lows_window, closes_window, period=14)
+                atr_pct_price = (atr_value / max(price_at_signal, 1)) * 100
+            else:
+                # Too few candles — use floor values so thresholds are minimal
+                atr_value = price_at_signal * 0.001  # ~0.1% ATR default
+                atr_pct_price = 0.1
 
             # Signal type: check if this is an exhaustion reversal signal
             is_reversal_signal = dict(row).get("signal_type") == "exhaustion_reversal"
@@ -233,8 +269,8 @@ def verify_pending_signals():
             # Dynamic minimum move: based on ATR, adapts to current volatility.
             # A 0.3×ATR bar is meaningful; 0.5× is a "significant move".
             # Floor protection: even when ATR is extremely low, don't demand zero movement.
-            tf_atr_mult_min = {"30m": 0.2, "1h": 0.3, "4h": 0.4}
-            tf_atr_mult_sig = {"30m": 0.3, "1h": 0.5, "4h": 0.25}
+            tf_atr_mult_min = {"30m": 0.2, "1h": 0.3, "4h": 0.25}
+            tf_atr_mult_sig = {"30m": 0.3, "1h": 0.5, "4h": 0.5}
             tf_min_move_floor = {"30m": 0.05, "1h": 0.08, "4h": 0.10}
             min_move_dynamic = max(atr_pct_price * tf_atr_mult_min.get(tf, 0.3), tf_min_move_floor.get(tf, 0.05))
             sig_move_dynamic = max(atr_pct_price * tf_atr_mult_sig.get(tf, 0.5), tf_min_move_floor.get(tf, 0.05) * 1.5)
@@ -243,8 +279,9 @@ def verify_pending_signals():
             move_pct = abs(current_price - price_at_signal) / max(price_at_signal, 1) * 100
 
             # 1. Direction check (for ranging signals, direction_correct = 1 since direction N/A)
-            # For directional signals, require at least the minimum ATR-based move.
-            # Price moving 0.01% in the "right" direction is noise, not confirmation.
+            # direction_correct only checks if price moved in the predicted direction,
+            # regardless of magnitude. move_sufficient separately tracks whether
+            # the move was large enough to be meaningful (ATR-based).
             if is_ranging:
                 direction_correct = 1
                 actual_direction = "neutral"
@@ -252,8 +289,8 @@ def verify_pending_signals():
                 move_direction = (
                     "bullish" if current_price >= price_at_signal else "bearish"
                 )
-                # Only count as direction-correct if move exceeds minimum ATR threshold
-                if move_direction == direction and move_pct >= min_move_dynamic:
+                # direction_correct = right direction (any magnitude)
+                if move_direction == direction:
                     direction_correct = 1
                 else:
                     direction_correct = 0
@@ -272,12 +309,27 @@ def verify_pending_signals():
             # high_volatility gets extra room since it implies wider swings.
             price_range_pct = (all_high - all_low) / max(price_at_signal, 1) * 100
 
-            adx_verify = calc_adx_func(highs_all, lows_all, closes_all, period=adx_verify_period)
-            verify_adx = adx_verify["adx"]
+            # Need ≥29 candles for ADX (14*2+1). If insufficient, default to low ADX
+            # (20) so no_trend checks pass — we can't reliably assess trend strength.
+            if len(highs_window) >= 29:
+                adx_verify = calc_adx_func(highs_window, lows_window, closes_window, period=adx_verify_period)
+                verify_adx = adx_verify["adx"]
+            else:
+                verify_adx = 20  # low default — no strong trend detected
 
             # No significant trend developed?
-            # ATR-based move threshold replaces fixed percentages.
-            no_trend = move_pct < sig_move_dynamic or verify_adx < 28
+            # Require BOTH: price didn't move significantly AND ADX stayed low.
+            # Using AND prevents false positives — a large price move with low ADX
+            # could be a real breakout, and high ADX with small move could be early trend.
+            no_trend = move_pct < sig_move_dynamic and verify_adx < 28
+
+            # Ranging-specific trend check: ranging signals need a higher bar
+            # to be considered "wrong". A 0.5×ATR move within a range is normal
+            # noise, not a trend. Use 1.0×ATR as the ranging threshold — a move
+            # needs to be genuinely directional to invalidate a ranging call.
+            tf_ranging_atr_mult = {"30m": 1.0, "1h": 1.0, "4h": 1.0}
+            ranging_move_threshold = max(atr_pct_price * tf_ranging_atr_mult.get(tf, 1.0), tf_min_move_floor.get(tf, 0.05) * 2)
+            no_trend_ranging = move_pct < ranging_move_threshold and verify_adx < 28
 
             # Also check price range didn't explode beyond even high-vol bounds
             if regime_at_signal == "high_volatility":
@@ -287,10 +339,10 @@ def verify_pending_signals():
             atr_threshold_pct = (atr_value / max(price_at_signal, 1)) * 100 * tf_atr_mult.get(tf, 1.2)
             range_ok = price_range_pct <= atr_threshold_pct
 
-            # Ranging is correct if: no significant trend developed AND
+            # Ranging is correct if: no significant trend developed (higher threshold) AND
             # range didn't explode beyond extreme volatility bounds.
             # range_ok is a safety valve for true breakouts, not a hard gate.
-            ranging_correct = no_trend and range_ok
+            ranging_correct = no_trend_ranging and range_ok
 
             # 2c. Price structure validation — verify trend integrity.
             # For exhaustion reversal or ranging breakout signals, skip price structure check:
@@ -333,34 +385,44 @@ def verify_pending_signals():
 
             # 3. Regime correctness — decomposed into sub-metrics
             from app.indicators import calc_adx
-            adx_data = calc_adx(highs_all, lows_all, closes_all, period=adx_verify_period)
-            current_adx = adx_data["adx"]
+            # Use verification window (not full 200 candles) so ADX reflects
+            # market conditions at signal time, not current rolling average.
+            # Need at least 29 candles for ADX (14*2+1). If window is too small,
+            # use a neutral default (25) — ADX-dependent checks will fail gracefully.
+            if len(highs_window) >= 29:
+                adx_data = calc_adx(highs_window, lows_window, closes_window, period=adx_verify_period)
+                current_adx = adx_data["adx"]
+            else:
+                current_adx = 25  # neutral default
 
             # Sub-metrics: independent outputs for evolution system
             move_sufficient = 1 if move_pct >= min_move_dynamic else 0
             structure_aligned = 1 if price_structure_ok else 0
 
             if regime_at_signal == "trending":
-                # Direction correct AND minimum move AND price structure (strict mode).
-                # In low-volatility markets, direction correct + one auxiliary is sufficient (loose mode).
+                # Strict mode: direction correct + meaningful move.
+                # Removed structure_aligned requirement — normal trends frequently
+                # have pullback candles that break short-window structure checks,
+                # causing the evolution system to over-tighten thresholds based on
+                # false failures. Structure check remains tracked as a sub-metric.
                 trend_persisted = (
                     direction_correct
                     and move_sufficient
-                    and structure_aligned
                 )
                 # Loose: direction correct + meaningful move. Structure check is too
                 # noisy on short verify windows (3 candles can easily break structure
                 # even when the trend goes the right way).
                 regime_correct_loose = 1 if (direction_correct and move_sufficient) else 0
             elif regime_at_signal == "forming":
-                # Forming = "a trend is developing". ADX should show some rise,
-                # but +2 is too strict for early-stage signals. Use +1.
-                adx_at_signal = row["adx"] or 0
-                adx_rising = current_adx >= adx_at_signal + 1
-                has_price_action = move_pct >= (min_move_dynamic * 0.5)
-                trend_persisted = adx_rising and has_price_action
-                # Loose: direction correct + any meaningful move, no ADX gate.
-                # Captures trends where price moved correctly but ADX hasn't caught up yet.
+                # Forming = "a trend is developing".
+                # The stored ADX at signal time uses a 200-candle rolling window,
+                # but when we re-verify, the 200-candle window has shifted — comparing
+                # two different rolling windows is inherently unreliable.
+                # Replace ADX comparison with price direction: if the signal predicted
+                # a forming bullish trend and price moved bullish by the minimum
+                # threshold, the forming call was correct.
+                # ADX rising is a secondary signal, not a hard gate.
+                trend_persisted = direction_correct and move_sufficient
                 regime_correct_loose = 1 if (direction_correct and move_sufficient) else 0
             elif regime_at_signal == "low_vol_trend":
                 trend_persisted = direction_correct and current_adx >= 25
@@ -435,8 +497,9 @@ def verify_pending_signals():
 
                 # Check stage2_upgraded: look for a same-direction trending signal
                 # within 8 candles after this Stage 1 signal.
+                _candle_seconds_map = {"30m": 1800, "1h": 3600, "4h": 14400}
                 window_bars = 8
-                window_seconds = candle_seconds.get(tf, 3600) * window_bars
+                window_seconds = _candle_seconds_map.get(tf, 3600) * window_bars
                 s2_row = conn.execute(
                     "SELECT id FROM signals WHERE timeframe = ? "
                     "AND direction = ? AND regime = 'trending' "
@@ -455,9 +518,9 @@ def verify_pending_signals():
             longer_term_valid = 0
             if not trend_persisted and direction and regime_at_signal in ("trending", "forming"):
                 lt_extend = 6
-                lt_end = min(signal_idx + VERIFY_CANDLES[tf] + lt_extend + 1, len(candles))
+                lt_end = min(signal_idx + n_verify + lt_extend + 1, len(candles))
                 lt_candles = candles[signal_idx + 1:lt_end]
-                if len(lt_candles) > VERIFY_CANDLES[tf]:
+                if len(lt_candles) > n_verify:
                     lt_close = lt_candles[-1]["close"]
                     lt_move = (lt_close - price_at_signal) / max(price_at_signal, 1) * 100
                     if direction == "bullish" and lt_close >= price_at_signal:
@@ -498,7 +561,8 @@ def verify_pending_signals():
             )
 
     conn.commit()
-    conn.close()
+    if own_conn:
+        conn.close()
 
 
 def _clamp(key: str, value: float) -> float:
@@ -587,10 +651,12 @@ def _compute_evolution_adjustments(stats: dict) -> dict:
             else:
                 break
 
-        # ─── Force correction: bypass last_verified when consecutive wrong >= 3
-        # Only allow force correction when we have enough verified signals (>=10)
+        # ─── Force correction: bypass last_verified when consecutive wrong >= 4
+        # Only allow force correction when we have enough verified signals (>=30)
         # to avoid overreacting to short streaks with tiny sample sizes.
-        if consecutive_wrong >= 3 and verified >= 10:
+        # At 50% baseline accuracy, 4-in-a-row = 6.25% probability (vs 12.5% for 3),
+        # reducing false trigger frequency from ~1-in-8 to ~1-in-16 streaks.
+        if consecutive_wrong >= 4 and verified >= 30:
             floor, _ = THRESHOLD_BOUNDS["adx_trending_threshold"]
             if tf_trending <= floor + 0.5:
                 # Already at floor: only mark unreliable if overall accuracy is also poor.
@@ -615,8 +681,8 @@ def _compute_evolution_adjustments(stats: dict) -> dict:
             tf_cfg["consecutive_wrong_regime"] = 0
             tf_cfg["unreliable"] = False
 
-        # ─── Normal adjustment: only when enough signals verified (>=20)
-        # Below 20, use gray-zone micro-tuning only to prevent runaway drift
+        # ─── Normal adjustment: only when enough signals verified (>=30)
+        # Below 30, use gray-zone micro-tuning only to prevent runaway drift
         # from small sample sizes.
         last_verified = last_counts.get(tf, 0)
         if verified <= last_verified:
@@ -624,7 +690,7 @@ def _compute_evolution_adjustments(stats: dict) -> dict:
 
         new_params[tf] = verified  # Mark that we'll adjust for this TF
 
-        if verified >= 20:
+        if verified >= 30:
             # Full adjustment: regime/dir accuracy driven
             # Regime accuracy → adjust this TF's trending threshold
             if regime_acc > 70:

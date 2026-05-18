@@ -26,6 +26,8 @@ body {
 .user-bar { display: flex; align-items: center; gap: 10px; }
 .live-badge { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #6b7280; }
 .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; animation: pulse 2s infinite; }
+.live-dot.disconnected { background: #ef4444; animation: none; }
+.live-dot.reconnecting { background: #f59e0b; animation: pulse 0.8s infinite; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
 .tab-btn {
   padding: 6px 16px; border-radius: 6px; border: 1px solid #374151;
@@ -50,6 +52,19 @@ body {
 .ticker-value.price { color: #fff; font-size: 24px; }
 
 .main { padding: 20px 30px; }
+
+/* ─── Error Banner ─── */
+.error-banner {
+  margin: 10px 30px; padding: 12px 16px; border-radius: 8px;
+  background: #450a0a; border: 1px solid #ef4444; color: #fca5a5;
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 14px; font-weight: 500;
+}
+.error-dismiss {
+  background: none; border: none; color: #fca5a5; font-size: 20px;
+  cursor: pointer; padding: 0 4px; line-height: 1;
+}
+.error-dismiss:hover { color: #fff; }
 
 /* ─── Overall Signal ─── */
 .overall-signal {
@@ -473,6 +488,10 @@ body {
 .sim-stat-label { font-size: 10px; color: #6b7280; margin-bottom: 4px; text-transform: uppercase; }
 .sim-stat-value { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
 
+.sim-equity {
+  background: #111827; border-radius: 12px; border: 1px solid #1f2937;
+  padding: 20px; margin-top: 16px;
+}
 .sim-history {
   background: #111827; border-radius: 12px; border: 1px solid #1f2937;
   padding: 20px; margin-top: 16px;
@@ -598,7 +617,6 @@ body {
 .entry-market { font-size: 11px; padding: 3px 8px; border-radius: 4px; background: rgba(34,197,94,0.15); color: #22c55e; }
 .entry-limit { font-size: 11px; padding: 3px 8px; border-radius: 4px; background: rgba(59,130,246,0.15); color: #3b82f6; }
 .entry-wait { font-size: 11px; padding: 3px 8px; border-radius: 4px; background: rgba(239,68,68,0.15); color: #ef4444; }
-.order-decay { font-size: 11px; padding: 3px 10px; border-radius: 12px; background: rgba(234,179,8,0.15); color: #eab308; font-weight: 700; border: 1px solid rgba(234,179,8,0.3); }
 .conf-高 { background: rgba(34,197,94,0.15); color: #22c55e; }
 .conf-中 { background: rgba(234,179,8,0.15); color: #eab308; }
 .conf-低 { background: rgba(239,68,68,0.15); color: #ef4444; }
@@ -645,8 +663,8 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
       </div>
       <div class="user-bar">
         <div class="live-badge">
-          <div class="live-dot"></div>
-          <span>{{ updateTime }}</span>
+          <div class="live-dot" :class="wsStatus"></div>
+          <span v-if="wsStatusText">{{ wsStatusText }} · </span><span>{{ updateTime }}</span>
         </div>
         <button class="logout-btn" @click="logout">退出</button>
       </div>
@@ -684,6 +702,12 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
     正在获取数据...
   </div>
 
+  <!-- Error banner -->
+  <div v-if="errorMessage" class="error-banner">
+    <span>{{ errorMessage }}</span>
+    <button class="error-dismiss" @click="errorMessage = ''">×</button>
+  </div>
+
   <div class="main" v-if="data">
 
     <!-- ═══ 信号 Tab ═══ -->
@@ -694,7 +718,7 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
           {{ verdictRegimeText }}
         </div>
         <div class="verdict-summary">{{ data.verdict.summary }}</div>
-        <div class="verdict-confidence" v-if="data.verdict.regime==='trending'">
+        <div class="verdict-confidence" v-if="data.verdict.regime==='trending'||data.verdict.regime==='low_vol_trend'">
           置信度 {{ data.verdict.confidence }}% · 强度 {{ data.verdict.strength }}
           <span v-if="data.verdict.momentum"> · 动量{{ data.verdict.momentum }}</span>
         </div>
@@ -738,7 +762,6 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
           <span class="order-entry-type" :class="'entry-'+data.verdict.order_signal.entry_type">
             {{ {market:'市价',limit:'限价',wait:'等待'}[data.verdict.order_signal.entry_type] || '市价' }}
           </span>
-          <span v-if="data.verdict.order_signal.decay" class="order-decay">衰减·轻仓</span>
           <span class="order-confidence" :class="'conf-'+data.verdict.order_signal.confidence">
             {{ data.verdict.order_signal.confidence }}信心
           </span>
@@ -746,7 +769,7 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
         <div class="order-grid">
           <div class="order-cell">
             <div class="order-label">入场价</div>
-            <div class="order-value">{{ fmt(data.verdict.order_signal.entry_price) }}</div>
+            <div class="order-value">{{ fmt(data.ticker.price) }}</div>
             <div class="order-sub">{{ data.verdict.order_signal.entry_note }}</div>
           </div>
           <div class="order-cell">
@@ -759,15 +782,16 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
           </div>
           <div class="order-cell">
             <div class="order-label">盈亏比</div>
-            <div class="order-value rr">{{ data.verdict.order_signal.rr_ratio }}</div>
-            <div class="order-sub" v-if="data.verdict.order_signal.current_rr && data.verdict.order_signal.entry_type !== 'market'">
-              现价 {{ data.verdict.order_signal.current_rr }}
+            <div class="order-value rr">
+              <span :style="{color: (data.verdict.order_signal.current_rr && data.verdict.order_signal.current_rr < 1.0) ? '#ef4444' : '#22c55e'}">{{ data.verdict.order_signal.current_rr || '-' }}</span>
+              <span style="color:#6b7280;font-size:11px;margin:0 4px">/</span>
+              <span>{{ data.verdict.order_signal.rr_ratio }}</span>
             </div>
           </div>
         </div>
         <div class="order-footer">
           <span>杠杆 {{ data.verdict.order_signal.leverage }}</span>
-          <span>风险 {{ data.verdict.order_signal.decay ? '1' : '2' }}%</span>
+          <span>风险 {{ data.verdict.order_signal.risk?.toFixed(1) }} 点</span>
           <span>仓位 ≤{{ data.verdict.order_signal.position_pct }}%</span>
         </div>
       </div>
@@ -993,7 +1017,7 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
             <span class="h-regime" :class="hRegimeClass(h.regime, h.direction)">
               {{ hRegimeText(h.regime, h.direction) }}
             </span>
-            <span class="h-strength" v-if="h.regime==='trending'">{{ h.strength }}</span>
+            <span class="h-strength" v-if="h.regime==='trending'||h.regime==='low_vol_trend'">{{ h.strength }}</span>
             <span class="h-adx">4h:{{ h.adx_4h?.toFixed(0)||'-' }} 1h:{{ h.adx_1h?.toFixed(0)||'-' }}</span>
             <span class="h-advice" :class="h.advice&&(h.advice.includes('做')?'act':h.advice.includes('减')||h.advice.includes('离')?'exit':'')">{{ h.advice || '-' }}</span>
           </div>
@@ -1024,7 +1048,7 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
     <template v-if="tab==='position'">
       <div class="pos-monitor">
         <!-- 模拟仓位统计卡片 -->
-        <div class="sim-stats-bar" v-if="simPosition || simStats.total_trades > 0">
+        <div class="sim-stats-bar" v-if="simStats">
           <div class="sim-stat">
             <div class="sim-stat-label">模拟资产</div>
             <div class="sim-stat-value" style="color:#fff">{{ simStats.current_balance.toFixed(2) }} U</div>
@@ -1050,6 +1074,13 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
             <div class="sim-stat-label">总交易次数</div>
             <div class="sim-stat-value" style="color:#9ca3af">{{ simStats.total_trades }}</div>
           </div>
+          <div class="sim-stat">
+            <div class="sim-stat-label">胜率</div>
+            <div class="sim-stat-value" :class="simStats.win_rate >= 50 ? 'up' : 'down'">
+              {{ simStats.win_rate }}%
+              <span style="font-size:11px;color:#6b7280">({{ simStats.wins }}胜{{ simStats.losses }}负)</span>
+            </div>
+          </div>
         </div>
 
         <div class="sim-card" v-if="simPosition">
@@ -1059,7 +1090,11 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
               {{ simPosition.side === 'long' ? '多' : '空' }} {{ simPosition.leverage }}x
             </span>
             <span style="font-size:12px;color:#6b7280">
-              仓位 {{ simPositionSize }} BTC · {{ fmt(simNotionalValue) }} U
+              仓位 {{ simPositionSize }} BTC
+              <template v-if="simPosition.original_size && simPosition.original_size > simPosition.position_size">
+                · 原始 {{ simPosition.original_size.toFixed(4) }} BTC（已减仓50%）
+              </template>
+              · {{ fmt(simNotionalValue) }} U
               · 入场 {{ fmt(simPosition.entry_price) }} · {{ simHoldTime }}
             </span>
           </div>
@@ -1103,12 +1138,19 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
           <span class="sim-badge" style="margin-right:6px">模拟</span> 暂无模拟仓位，等待信号触发自动开仓
         </div>
 
+        <!-- 7天资金曲线 -->
+        <div class="sim-equity" v-if="simEquityCurve && simEquityCurve.length > 0">
+          <div class="sim-history-title">7天资金曲线</div>
+          <div ref="equityChartRef" style="height:200px"></div>
+        </div>
+
         <!-- 模拟仓位历史记录 -->
         <div class="sim-history" v-if="simHistory && simHistory.length > 0">
           <div class="sim-history-title">模拟仓位历史记录</div>
           <table class="sim-history-table">
             <thead>
               <tr>
+                <th>订单ID</th>
                 <th>时间</th>
                 <th>操作</th>
                 <th>方向</th>
@@ -1123,6 +1165,7 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
             </thead>
             <template v-for="(h, i) in simHistory" :key="h.action_id || h.id || i">
               <tr>
+                <td style="font-family:monospace;color:#6b7280">{{ h.id }}</td>
                 <td style="font-family:monospace;color:#6b7280">{{ fmtClock(h.created_at) }}</td>
                 <td :style="{fontWeight:600, color: histActionColor(h)}">{{ histActionLabel(h) }}</td>
                 <td>
@@ -1257,7 +1300,7 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
               <tbody>
                 <tr v-for="(r,i) in tf.recent" :key="i">
                   <td>
-                    <span :class="r.regime==='trending'?(r.direction==='bullish'?'up':'down'):r.regime==='breakout'?'up':r.regime==='exhaustion'||r.regime==='high_volatility'?'warn':''" style="font-size:12px">
+                    <span :class="r.regime==='trending'?(r.direction==='bullish'?'up':'down'):r.regime==='breakout'?'up':r.regime==='exhaustion'||r.regime==='high_volatility'?'warn':r.regime==='low_vol_trend'?(r.direction==='bullish'?'up':'down'):''" style="font-size:12px">
                       {{ hRegimeText(r.regime, r.direction) }}
                     </span>
                   </td>
@@ -1397,6 +1440,8 @@ createApp({
     const data = ref(null);
     const tab = ref('signals');
     const updateTime = ref('');
+    const errorMessage = ref('');
+    const wsStatus = ref(''); // '', 'connected', 'disconnected', 'reconnecting'
     let ws = null;
 
     // ── 模拟仓位 ──
@@ -1406,7 +1451,9 @@ createApp({
     const simPageSize = ref(10);
     const simTotalPages = ref(0);
     const simTotal = ref(0);
-    const simStats = ref({ initial_balance: 10000, current_balance: 10000, realized_pnl: 0, today_pnl: 0, total_trades: 0, today_trades: 0, available_balance: 10000, margin_used: 0 });
+    const simStats = ref({ initial_balance: 10000, current_balance: 10000, realized_pnl: 0, today_pnl: 0, total_trades: 0, today_trades: 0, available_balance: 10000, margin_used: 0, win_rate: 0, wins: 0, losses: 0 });
+    const simEquityCurve = ref([]);
+    const equityChartRef = ref(null);
 
     // ── 模拟仓位加载 ──
     const loadSimPosition = async () => {
@@ -1438,10 +1485,85 @@ createApp({
       try {
         const resp = await fetch('./api/position/simulated/stats');
         if (resp.ok) {
-          simStats.value = await resp.json();
+          const d = await resp.json();
+          simStats.value = d;
+          simEquityCurve.value = d.equity_curve || [];
         }
       } catch(e) {}
     };
+
+    // 渲染7天资金曲线（纯 SVG，无依赖）
+    const renderEquityChart = () => {
+      const container = equityChartRef.value;
+      if (!container) return;
+      const pts = simEquityCurve.value;
+      if (pts.length < 2) {
+        container.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#4b5563;font-size:13px">数据不足</div>`;
+        return;
+      }
+      const w = container.clientWidth || container.getBoundingClientRect().width || 600;
+      const h = 200;
+      const pad = { t: 20, r: 20, b: 30, l: 55 };
+      const chartW = w - pad.l - pad.r;
+      const chartH = h - pad.t - pad.b;
+      const minV = Math.min(...pts.map(p => p.balance));
+      const maxV = Math.max(...pts.map(p => p.balance));
+      const range = maxV - minV || 1;
+      const yMin = minV - range * 0.1;
+      const yMax = maxV + range * 0.1;
+      const yRange = yMax - yMin;
+
+      const scaleX = (i) => pad.l + (i / (pts.length - 1)) * chartW;
+      const scaleY = (v) => pad.t + chartH - ((v - yMin) / yRange) * chartH;
+
+      // Line path
+      let linePath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${scaleX(i).toFixed(1)} ${scaleY(p.balance).toFixed(1)}`).join(' ');
+
+      // Area path (fill below line)
+      let areaPath = linePath + ` L ${scaleX(pts.length - 1).toFixed(1)} ${(pad.t + chartH).toFixed(1)} L ${scaleX(0).toFixed(1)} ${(pad.t + chartH).toFixed(1)} Z`;
+
+      // Grid lines (5 horizontal)
+      let gridLines = '';
+      for (let i = 0; i < 5; i++) {
+        const v = yMin + (yRange / 4) * i;
+        const y = scaleY(v).toFixed(1);
+        gridLines += `<line x1="${pad.l}" y1="${y}" x2="${w - pad.r}" y2="${y}" stroke="#1f2937" stroke-width="1"/>`;
+        gridLines += `<text x="${pad.l - 5}" y="${parseFloat(y) + 4}" text-anchor="end" fill="#6b7280" font-size="10">${v.toFixed(0)}</text>`;
+      }
+
+      // X-axis labels
+      let xLabels = '';
+      const step = Math.max(1, Math.floor(pts.length / 7));
+      pts.forEach((p, i) => {
+        if (i % step === 0 || i === pts.length - 1) {
+          xLabels += `<text x="${scaleX(i).toFixed(1)}" y="${h - 5}" text-anchor="middle" fill="#6b7280" font-size="9">${p.date.slice(5)}</text>`;
+        }
+      });
+
+      // Data points
+      let dots = pts.map((p, i) => `<circle cx="${scaleX(i).toFixed(1)}" cy="${scaleY(p.balance).toFixed(1)}" r="3" fill="${p.balance >= pts[0].balance ? '#22c55e' : '#ef4444'}" stroke="#111827" stroke-width="1"/>`).join('');
+
+      // Baseline (initial balance)
+      const baselineY = scaleY(pts[0].balance).toFixed(1);
+      const baseline = `<line x1="${pad.l}" y1="${baselineY}" x2="${w - pad.r}" y2="${baselineY}" stroke="#fbbf24" stroke-width="1" stroke-dasharray="4,4"/>`;
+
+      const svg = `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" style="display:block;max-width:${w}px">
+        ${gridLines}
+        ${baseline}
+        <path d="${areaPath}" fill="rgba(99,102,241,0.1)"/>
+        <path d="${linePath}" fill="none" stroke="#6366f1" stroke-width="2"/>
+        ${dots}
+        ${xLabels}
+      </svg>`;
+      container.innerHTML = svg;
+    };
+
+    // Watch for equity curve changes and re-render
+    watch(() => simEquityCurve.value, () => {
+      Vue.nextTick(() => {
+        setTimeout(() => renderEquityChart(), 150);
+      });
+    }, { deep: true });
 
     // 模拟仓位实时 PnL
     const simPnl = computed(() => {
@@ -1489,24 +1611,13 @@ createApp({
       return parts.join(' · ');
     });
 
-    // 仓位大小：BTC数量 = 假设初始余额10000U的2%风险 / 止损距离 * 入场价 反推
-    // 实际开仓时 leverage=5, 按 2% 风控, position notional = sim_initial_balance * 0.02 * leverage / (stop_distance_pct/100)
-    // 简化：直接从 entry_price * leverage 反推名义价值 / 入场价
+    // Position size: use actual position_size from DB (BTC quantity)
     const simPositionSize = computed(() => {
-      if (!simPosition.value || !currentPrice.value) return '-';
+      if (!simPosition.value) return '-';
       const p = simPosition.value;
-      const entry = p.entry_price;
-      const stop = p.stop;
-      // 按 2% 风控模型: risk_amount = SIM_INITIAL_BALANCE * 0.02
-      // btc_size = risk_amount / |entry - stop| * leverage
-      if (stop && stop !== entry) {
-        const riskAmt = (window.SIM_INITIAL_BALANCE || 10000) * 0.02;
-        const btcSize = riskAmt / Math.abs(entry - stop) * (p.leverage || 5);
-        return btcSize.toFixed(4);
-      }
-      // 无止损时按默认仓位显示
-      const defaultNotional = (window.SIM_INITIAL_BALANCE || 10000) * (p.leverage || 5);
-      return (defaultNotional / entry).toFixed(4);
+      const size = parseFloat(p.position_size);
+      if (isNaN(size) || size === 0) return '-';
+      return size.toFixed(4);
     });
 
     const simNotionalValue = computed(() => {
@@ -1615,6 +1726,7 @@ createApp({
       if (regime === 'exhaustion') return direction === 'bullish' ? '衰竭·多' : '衰竭·空';
       if (regime === 'high_volatility') return '高波动';
       if (regime === 'low_volatility') return '低波动';
+      if (regime === 'low_vol_trend') return direction === 'bullish' ? '低波动·看涨' : '低波动·看跌';
       return '震荡';
     };
 
@@ -1625,6 +1737,7 @@ createApp({
       if (regime === 'exhaustion') return direction === 'bullish' ? '多头衰竭' : '空头衰竭';
       if (regime === 'high_volatility') return '高波动';
       if (regime === 'low_volatility') return '低波动';
+      if (regime === 'low_vol_trend') return direction === 'bullish' ? '低波动趋势·看涨' : '低波动趋势·看跌';
       return '震荡';
     };
 
@@ -1633,6 +1746,7 @@ createApp({
       if (regime === 'breakout') return direction === 'bullish' ? 'up' : 'down';
       if (regime === 'exhaustion') return 'warn';
       if (regime === 'high_volatility') return 'warn';
+      if (regime === 'low_vol_trend') return direction === 'bullish' ? 'up' : 'down';
       return '';
     };
 
@@ -1646,6 +1760,10 @@ createApp({
       if (r === 'exhaustion') return `趋势衰竭（${v.direction === 'bullish' ? '多' : '空'}头减弱）`;
       if (r === 'high_volatility') return `高波动预警（ATR%=${v.timeframes?.['4h']?.atr_pct?.toFixed(2) || '-'})`;
       if (r === 'low_volatility') return `低波动蓄力（ATR%=${v.timeframes?.['4h']?.atr_pct?.toFixed(2) || '-'})`;
+      if (r === 'low_vol_trend') {
+        const dir = v.direction === 'bullish' ? '看涨' : '看跌';
+        return `低波动${dir}趋势（ATR%=${v.timeframes?.['4h']?.atr_pct?.toFixed(2) || '-'})`;
+      }
       return '震荡行情';
     });
 
@@ -1914,32 +2032,89 @@ createApp({
     };
 
     const connectWs = () => {
-      // 每 10 秒轮询刷新，不使用 WebSocket
-      setInterval(async () => {
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${location.host}/ws`;
+      let pollTimer = null;
+      let signalPollTimer = null;
+
+      const connect = () => {
+        if (ws) { try { ws.close(); } catch(e) {} }
+        wsStatus.value = 'reconnecting';
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => { wsStatus.value = 'connected'; };
+
+        ws.onmessage = (evt) => {
+          if (evt.data === 'ping') return;
+          try {
+            const msg = JSON.parse(evt.data);
+            if (msg.verdict) {
+              // Full verdict refresh via WS
+              data.value = msg;
+              if (msg.simulated_position) {
+                simPosition.value = msg.simulated_position;
+              }
+              updateTime.value = new Date().toLocaleTimeString('zh-CN');
+            }
+          } catch(e) { console.error('ws parse error', e); }
+        };
+
+        ws.onclose = () => {
+          wsStatus.value = 'disconnected';
+          ws = null;
+          setTimeout(connect, 5000);
+        };
+        ws.onerror = () => { ws.close(); };
+      };
+
+      connect();
+
+      // HTTP polling for sim position/history/stats (not pushed via WS)
+      pollTimer = setInterval(async () => {
         try {
-          await fetchSignals();
           await loadSimPosition();
           await loadSimHistory();
           await loadSimStats();
         } catch(e) { console.error(e); }
       }, 10000);
+
+      // HTTP polling fallback for signals (every 30s) — catches WS disconnect staleness
+      signalPollTimer = setInterval(async () => {
+        if (wsStatus.value !== 'connected') {
+          try { await fetchSignals(); } catch(e) {}
+        }
+      }, 30000);
+
+      // Store timers for cleanup
+      connectWs._pollTimer = pollTimer;
+      connectWs._signalPollTimer = signalPollTimer;
     };
 
     const fetchSignals = async () => {
-      const resp = await fetch('./api/signals');
-      if (resp.status === 401) {
-        goLogin();
-        return;
+      try {
+        const resp = await fetch('./api/signals');
+        if (resp.status === 401) {
+          goLogin();
+          return;
+        }
+        if (!resp.ok) {
+          errorMessage.value = `信号获取失败 (${resp.status})`;
+          setTimeout(() => { errorMessage.value = ''; }, 15000);
+          return;
+        }
+        errorMessage.value = '';
+        data.value = await resp.json();
+        if (data.value.simulated_position) {
+          simPosition.value = data.value.simulated_position;
+        } else if (simPosition.value) {
+          simPosition.value = null;
+        }
+        updateTime.value = new Date().toLocaleTimeString('zh-CN');
+      } catch(e) {
+        errorMessage.value = '信号获取失败：网络连接异常';
+        setTimeout(() => { errorMessage.value = ''; }, 15000);
+        console.error(e);
       }
-      data.value = await resp.json();
-      // Sync simulated position from signals response
-      if (data.value.simulated_position) {
-        simPosition.value = data.value.simulated_position;
-      } else if (simPosition.value) {
-        // If no open sim position in response, clear it
-        simPosition.value = null;
-      }
-      updateTime.value = new Date().toLocaleTimeString('zh-CN');
     };
 
     const logout = async () => {
@@ -1960,12 +2135,23 @@ createApp({
       connectWs();
     });
 
-    onUnmounted(() => { if(ws) ws.close(); });
+    onUnmounted(() => {
+      if (ws) { ws.onclose = null; ws.close(); ws = null; }
+      if (connectWs._pollTimer) clearInterval(connectWs._pollTimer);
+      if (connectWs._signalPollTimer) clearInterval(connectWs._signalPollTimer);
+    });
 
-    return { data, tab, updateTime, sigText, fmt, fmtVol, fmtTime, fmtClock, overall, adviceType, evoTf, accClass, weightColor, logout,
+    const wsStatusText = computed(() => {
+      if (wsStatus.value === 'connected') return '实时';
+      if (wsStatus.value === 'reconnecting') return '重连中…';
+      if (wsStatus.value === 'disconnected') return '已断开';
+      return '';
+    });
+
+    return { data, tab, updateTime, errorMessage, wsStatus, wsStatusText, sigText, fmt, fmtVol, fmtTime, fmtClock, overall, adviceType, evoTf, accClass, weightColor, logout,
              verdictRegimeText, tfRegimeText, hRegimeText, hRegimeClass,
              dedupedHistory,
-             simPosition, simHistory, simPage, simPageSize, simTotalPages, simTotal, simPagePrev, simPageNext, simPageTo, simStats, simPositionSize, simNotionalValue, simPnl, simHoldTime, simActionStateText, simCloseReasonText, histActionLabel, histActionColor, histPrice, histPositionSize, histMargin, histDetail, histStatus, simHistSize, simHistMargin, simStopDist, simStopDistColor,
+             simPosition, simHistory, simPage, simPageSize, simTotalPages, simTotal, simPagePrev, simPageNext, simPageTo, simStats, simPositionSize, simNotionalValue, simPnl, simHoldTime, simActionStateText, simCloseReasonText, histActionLabel, histActionColor, histPrice, histPositionSize, histMargin, histDetail, histStatus, simHistSize, simHistMargin, simStopDist, simStopDistColor, equityChartRef,
              marketContextFundingRateText, marketContextFundingRateColor, marketContextOIText, marketContextCircuitBreakerWarning, marketContextConvergenceWarning, marketContextConvergenceDirection, marketContextConvergenceReason, marketContextRangingBreakout, marketContextRangingBreakoutDirection, marketContextRangingBreakoutReason, stage1Warning, stage1WarningTypeLabel, stage1WarningDirection, stage1WarningReason, stage1WarningPositionHint, stage1WarningConfidence, marketContextLeverageText, marketContextRiskText, marketContextVolAdjText, marketContextVolAdjColor, volAdjColor, tfVolPercent, tfBase, tfEff };
   }
 }).mount('#app');

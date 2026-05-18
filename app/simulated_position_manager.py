@@ -3,7 +3,7 @@
 Priority chain (strict):
   1. Stop loss (price hits stop)
   2. Take profit (price hits target)
-  3. PnL trailing stop (every 5% profit, lock 5% profit into stop)
+  3. PnL trailing stop (dual strategy: <30% lock 50% profit, >=30% fixed 10% pullback)
      After trailing stop moves, immediate price check to prevent one-cycle delay
   4. Emergency exit (high volatility + opposite direction, ADX dead)
      ADX dead: absolute (<20 and drop≥5) OR relative (drop ≥30% from entry)
@@ -11,10 +11,10 @@ Priority chain (strict):
   5. Signal reversal (verdict direction flipped against position)
   6. Trend exhaustion (verdict detects trend ending, immediate exit; skipped for exhaustion_reversal)
   7. ADX trailing stop (max_adx >= 30, current <= max_adx - max(8, max_adx*0.15); adaptive: 15/5 for aggressive)
-  7.5. Max hold time (slow=96h, default=48h, fast=24h; exit when signal weakens)
+  7.5. Max hold time (slow=120h, default=72h, fast=36h; exit when signal weakens + unprofitable; ≥5% PnL exempt)
   8. Exit signal (engine level='exit')
   9. Reduce signal (engine level='reduce', max 2 times -> then auto-exit)
-      After reduce: stop tightened 50% toward entry (normal) or to entry ±0.2% (DECAYING)
+      After reduce: stop remains at original level (not tightened)
       Reduce cooldown: half signal interval (faster response to escalating risk)
   10. Add signal (engine level='add', with trailing stop update)
   11. Hold (update max_adx)
@@ -37,7 +37,7 @@ Features:
   wait 2 cycles for opposite direction re-entry
 - Decay protection: when signal engine detects DECAYING trend, existing positions
   reduce 50%; stop tightened to entry ±0.2% (near breakeven)
-- PnL trailing stop: every 5% leveraged profit, lock 5% into stop (grace: 5-15 min);
+- PnL trailing stop: dual strategy — PnL < 30% locks 50% profit, PnL >= 30% uses fixed 10% pullback (grace: 5-15 min);
   immediate price check after trailing prevents one-cycle delay
 - Dynamic leverage: uses signal engine's order_signal.leverage (funding-rate adjusted),
   fallback: trending=20x, breakout=10x, forming=10x, exhaustion=10x, low_vol_trend=10x
@@ -128,74 +128,16 @@ def close_simulated_position(conn, position: dict, close_price: float, reason: s
             pass  # hook failure must not break position management
 
 
-def _atr_stop_floor(entry: float, atr=None, multiplier: float = 0.5) -> float:
-    """Minimum stop distance from entry based on ATR.
-
-    Prevents stop-tightening logic from placing stops within normal noise.
-    Default multiplier 0.5 → stop must be at least 0.5 × ATR from entry.
-    If ATR unavailable, falls back to 0.5% of entry price.
-    """
-    if atr and atr > 0:
-        return atr * multiplier
-    return entry * 0.005  # 0.5% fallback
-
-
-def _update_trailing_stop(conn, position: dict, tight_mode: bool = False, atr=None):
-    """After reduce: tighten stop to protect remaining position.
-
-    The original stop marks the trade's structural invalidation point.
-    After reduce, the risk has been partially realized, so we tighten
-    the stop to reduce exposure on the remaining position.
-
-    - Normal reduce: tighten stop halfway toward entry (50% of profit distance)
-    - DECAYING / tight_mode: tighten stop to entry ± max(0.5%, 0.5×ATR) (breakeven with ATR floor)
-    - Never move stop against the remaining position (long: only up, short: only down)
-    """
-    current_stop = position.get("stop")
-    entry = position.get("entry_price")
-    side = position.get("side")
-    if not current_stop or not entry:
-        return
-
-    if tight_mode:
-        # DECAYING: tighten to near breakeven with ATR floor.
-        # Stop must be at least 0.5×ATR from entry to avoid normal noise whipsaw.
-        min_stop_dist = _atr_stop_floor(entry, atr, multiplier=0.5)
-        if side == "long":
-            new_stop = round(max(entry + min_stop_dist, entry * 1.005), 1)
-            if new_stop > current_stop:
-                conn.execute("UPDATE positions SET stop=? WHERE id=?", (new_stop, position["id"]))
-                conn.commit()
-        else:
-            new_stop = round(max(entry + min_stop_dist, entry * 1.005), 1)
-            if new_stop < current_stop:
-                conn.execute("UPDATE positions SET stop=? WHERE id=?", (new_stop, position["id"]))
-                conn.commit()
-    else:
-        # Normal reduce: tighten stop 50% of the way toward entry.
-        # This reduces risk on remaining position while still giving it room.
-        if side == "long" and current_stop < entry:
-            new_stop = current_stop + (entry - current_stop) * 0.5
-            if new_stop > current_stop:
-                conn.execute("UPDATE positions SET stop=? WHERE id=?", (round(new_stop, 1), position["id"]))
-                conn.commit()
-        elif side == "short" and current_stop > entry:
-            new_stop = current_stop - (current_stop - entry) * 0.5
-            if new_stop < current_stop:
-                conn.execute("UPDATE positions SET stop=? WHERE id=?", (round(new_stop, 1), position["id"]))
-                conn.commit()
-
-
 def _check_pnl_trailing_stop(conn, sim_pos: dict, current_price: float) -> bool:
-    """PnL-based trailing stop: 持仓盈亏每增加5%，止损锁定5%利润。
+    """PnL-based trailing stop with dual strategy:
 
-    Logic (leveraged PnL %):
-      盈亏 5%  → 止损移到 entry（保本）
-      盈亏 10% → 止损移到 entry ± 5%
-      盈亏 15% → 止损移到 entry ± 10%
-      ...以此类推
+    Leveraged PnL < 30% → proportional lock (锁 50% profit)
+    Leveraged PnL >= 30% → fixed 10% pullback (从最高盈利回撤10%止损)
 
-    Short direction works symmetrically.
+    Examples at 20x leverage:
+      PnL 10% → stop at 5% profit  (price 0.25%)
+      PnL 20% → stop at 10% profit (price 0.50%)
+      PnL 40% → stop at 30% profit (price 1.50%) via fixed pullback
     """
     entry = sim_pos.get("entry_price")
     stop = sim_pos.get("stop")
@@ -212,7 +154,6 @@ def _check_pnl_trailing_stop(conn, sim_pos: dict, current_price: float) -> bool:
     created_at = sim_pos.get("created_at") or 0
     signal_type = sim_pos.get("signal_type") or ""
 
-    # Compute PnL first to decide whether grace should be waived
     price_move = (current_price - entry) if side == "long" else (entry - current_price)
     pnl_pct = price_move / entry * 100 * leverage
 
@@ -227,32 +168,33 @@ def _check_pnl_trailing_stop(conn, sim_pos: dict, current_price: float) -> bool:
     if pnl_pct < 5:
         return False
 
-    pnl_tier = int(pnl_pct / 5)
-    # Lock tier: only start trailing after pnl >= 10%.
-    # At 5-10% (tier 1), lock_tier=0 → locked_pct=0 → stop would be at entry,
-    # which is impossibly tight for BTC volatility ($22 move triggers it).
-    # Skip tier 0 to let the position breathe during early profit phase.
-    lock_tier = max(pnl_tier - 2, 0)
-    locked_pct = lock_tier * 5
-
-    # Trailing stop: move stop toward entry to lock gains.
-    # Stop must always remain in loss territory relative to entry:
-    #   Long:  stop BELOW entry  (price must drop to trigger stop_loss)
-    #   Short: stop ABOVE entry  (price must rise to trigger stop_loss)
-    #
-    # Trail distance = 50% of favorable move (price distance from entry),
-    # floored at 0.5% of entry to avoid whipsaw from BTC noise.
-    # At pnl_tier=1 (5-10% PnL), locked_pct=0 → uses 0.5% floor.
-    # At pnl_tier=2 (10-15%), locked_pct=5 → trail = 5/leverage% of entry.
-    favorable_move_pct = abs(current_price - entry) / entry
-    trail_pct = max(locked_pct / leverage / 100, favorable_move_pct * 0.5, 0.005)
-
-    if side == "long":
-        new_stop = round(entry * (1 - trail_pct), 1)
+    # Dual trailing strategy:
+    # PnL < 30%: proportional lock — trail = pnl_pct * 0.5
+    # PnL >= 30%: fixed pullback — trail = pnl_pct - 10 (locks 10% pullback room)
+    # NOTE: at the transition (29%→30%), the fixed pullback formula would
+    # produce a wider stop (20% vs 14.5%). The "favorable direction only" guard
+    # below prevents stop from moving backward, so stop stays at the tighter
+    # level until PnL grows enough that the new stop is tighter than current.
+    if pnl_pct >= 30:
+        # Fixed 10% pullback: stop locks at (pnl_pct - 10%) profit level
+        # At 30% pnl → stop at 20%; at 40% pnl → stop at 30%; at 60% pnl → stop at 50%
+        locked_pnl_pct = pnl_pct - 10
     else:
-        new_stop = round(entry * (1 + trail_pct), 1)
+        # Proportional lock: keep 50% of profit
+        locked_pnl_pct = pnl_pct * 0.5
 
-    # Only move stop in favorable direction
+    # Convert locked PnL % to price distance from entry
+    trail_pct = max(locked_pnl_pct / leverage / 100, 0.0015)
+
+    # PnL trailing stop: both directions move stop toward the profit side.
+    #   LONG:  stop moves UP to entry + trail (above entry, locks profit on pullback)
+    #   SHORT: stop moves DOWN to entry - trail (below entry, locks profit on bounce)
+    if side == "long":
+        new_stop = round(entry * (1 + trail_pct), 1)
+    else:
+        new_stop = round(entry * (1 - trail_pct), 1)
+
+    # Only move stop in favorable direction (closer to locked profit)
     if side == "long" and new_stop <= stop:
         return False
     if side == "short" and new_stop >= stop:
@@ -412,57 +354,18 @@ def _check_trend_exhaustion(conn, sim_pos: dict, verdict: dict, current_price: f
 
 
 def _check_circuit_breaker(conn, sim_pos: dict, verdict: dict, current_price: float) -> bool:
-    """P3.2: When circuit breaker fires, protect existing position.
+    """P3.2: When circuit breaker fires, immediately exit position.
 
     Circuit breaker reasons: flash crash (candle > ATR×3), liquidation cascade,
-    DI spread too low, ADX freeze. The engine sets circuit_breaker_reason but
-    may still output a directional signal if the regime is intact.
+    DI spread too low, ADX freeze.
     """
     market_ctx = verdict.get("market_context", {})
     cb_reason = market_ctx.get("circuit_breaker")
     if not cb_reason:
         return False
 
-    side = sim_pos["side"]
-    order_side = verdict.get("order_signal", {}).get("side", "")
-
-    # Circuit breaker + opposite direction signal → immediate exit
-    opposite = (side == "long" and order_side == "做空") or \
-               (side == "short" and order_side == "做多")
-    if opposite:
-        close_simulated_position(conn, sim_pos, current_price, f"circuit_breaker: {cb_reason}")
-        return True
-
-    # Circuit breaker + same direction → tighten stop to breakeven if in profit
-    current_stop = sim_pos.get("stop")
-    entry = sim_pos.get("entry_price")
-    if current_stop is None or entry is None:
-        return False
-
-    # Circuit breaker + same direction → tighten stop to breakeven if in profit.
-    # Stop distance uses ATR floor: at least 0.5×ATR from entry to avoid normal noise.
-    atr_30m = verdict.get("timeframes", {}).get("30m", {}).get("atr")
-    min_stop_dist = _atr_stop_floor(entry, atr_30m, multiplier=0.5)
-    if side == "long":
-        pnl_pct = (current_price - entry) / entry * 100
-    else:
-        pnl_pct = (entry - current_price) / entry * 100
-
-    if pnl_pct >= 0:
-        if side == "long":
-            new_stop = round(max(entry + min_stop_dist, entry * 1.005), 1)
-            if new_stop > current_stop:
-                conn.execute("UPDATE positions SET stop=? WHERE id=?", (new_stop, sim_pos["id"]))
-                conn.commit()
-                return True
-        else:
-            new_stop = round(max(entry + min_stop_dist, entry * 1.005), 1)
-            if new_stop < current_stop:
-                conn.execute("UPDATE positions SET stop=? WHERE id=?", (new_stop, sim_pos["id"]))
-                conn.commit()
-                return True
-
-    return False
+    close_simulated_position(conn, sim_pos, current_price, f"circuit_breaker: {cb_reason}")
+    return True
 
 
 def _check_adx_trailing_stop(conn, sim_pos: dict, verdict: dict, current_price: float) -> bool:
@@ -530,7 +433,7 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
     """Priority 5-8: Signal-based management (exit / reduce / add / hold).
 
     Multiple reduces: after MAX_REDUCE_COUNT, auto-exit on next reduce.
-    After reduce: stop tightened toward entry (50% normally, near breakeven for DECAYING).
+    After reduce: stop remains at original level.
     Pyramid add-on: up to MAX_ADD_COUNT, leverage decreases each time.
 
     add_count semantics: lifetime counter for the position, NOT reset on reduce.
@@ -585,24 +488,19 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
 
         # Update position: reduce size, record cumulative realized pnl
         cum_pnl = (sim_pos.get("realized_pnl") or 0) + realized_pnl
+        new_action_state = f"reduce_{new_reduce_count}"
         conn.execute(
-            "UPDATE positions SET action_state='reduced', reduce_count=?, "
-            "last_signal_time=?, position_size=?, realized_pnl=?, "
-            "realized_pnl_record=? WHERE id=?",
+            "UPDATE positions SET action_state=?, reduce_count=?, "
+            "last_signal_time=?, position_size=?, realized_pnl=? WHERE id=?",
             (
+                new_action_state,
                 new_reduce_count, now,
                 round(new_size, 6),
-                round(cum_pnl, 2),
                 round(cum_pnl, 2),
                 sim_pos["id"],
             ),
         )
         conn.commit()
-        # Detect DECAYING context for tighter stop tightening
-        market_ctx = verdict.get("market_context", {})
-        is_decay = market_ctx.get("trend_exhausted", {}).get("level") == "DECAYING"
-        atr_30m = verdict.get("timeframes", {}).get("30m", {}).get("atr")
-        _update_trailing_stop(conn, sim_pos, tight_mode=is_decay, atr=atr_30m)
 
         # Record reduce action
         conn.execute(
@@ -681,9 +579,6 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
                     except Exception:
                         pass
 
-                # DECAYING: tighten stop to near breakeven with ATR floor
-                atr_30m = verdict.get("timeframes", {}).get("30m", {}).get("atr")
-                _update_trailing_stop(conn, sim_pos, tight_mode=True, atr=atr_30m)
                 return
 
     if level == "add" and add_count < MAX_ADD_COUNT:
@@ -811,80 +706,6 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
             )
             conn.commit()
 
-        # DECAYING: tighten stop toward breakeven (50% of profit distance),
-        # but ONLY when position is in profit (>= 1% from entry).
-        # Minimum 5-minute interval to avoid micro-adjustments.
-        if is_decay:
-            DECAY_TIGHTEN_INTERVAL = 5 * 60  # 5 minutes
-            last_tightened = sim_pos.get("last_decay_tightened") or sim_pos.get("updated_at") or 0
-            if now - last_tightened >= DECAY_TIGHTEN_INTERVAL:
-                current_stop = sim_pos.get("stop")
-                entry = sim_pos["entry_price"]
-                pos_side = sim_pos["side"]
-                if current_stop and entry and entry > 0:
-                    if pos_side == "long":
-                        pnl_pct = (current_price - entry) / entry
-                        new_stop = current_stop + (current_price - current_stop) * 0.5
-                        new_stop = max(new_stop, current_stop)  # stop can only go up
-                    elif pos_side == "short":
-                        pnl_pct = (entry - current_price) / entry
-                        new_stop = current_stop - (current_stop - current_price) * 0.5
-                        new_stop = min(new_stop, current_stop)  # stop can only go down
-                    else:
-                        pnl_pct = 0
-                        new_stop = current_stop
-                    if pnl_pct >= 0.01 and abs(new_stop - current_stop) > 1:
-                        conn.execute(
-                            "UPDATE positions SET stop=?, last_decay_tightened=? WHERE id=?",
-                            (round(new_stop, 1), now, sim_pos["id"]),
-                        )
-                        conn.commit()
-
-    # ─── Stop/Target Sync from Signal Engine ───
-    # When the signal engine recalculates stop/target on each cycle, sync them
-    # to the position if they represent a meaningful improvement. This keeps
-    # the position manager aligned with the signal engine's latest assessment
-    # without overriding trailing stops or manual adjustments.
-    advice = verdict.get("advice", {})
-    advice_side = advice.get("side")
-    pos_side_matches = (side == "long" and advice_side == "多") or (side == "short" and advice_side == "空")
-
-    # Only applies when side matches and signal says hold.
-    # Works after reduce/add too — the sync only accepts improvements
-    # (stop moves favorably by >$10), so it can't override trailing stops.
-    # Skip during DECAYING: stop tightening must not be undone by a stale
-    # engine stop that was computed before the decay signal fired.
-    if level == "hold" and pos_side_matches and not is_decay:
-        new_stop = advice.get("stop")
-        new_target = advice.get("target")
-        current_stop = sim_pos.get("stop")
-        current_target = sim_pos.get("target")
-
-        updates = {}
-        entry = sim_pos.get("entry_price")
-        # Stop improvement: long → higher is better (but must stay < entry);
-        # short → lower is better (but must stay > entry).
-        # Without the entry guard, a stale engine stop below entry for shorts
-        # can corrupt a perfectly valid stop, causing immediate stop-loss.
-        if new_stop is not None and current_stop is not None and entry:
-            if side == "long" and new_stop > current_stop + 10 and new_stop < entry:
-                updates["stop"] = round(new_stop, 1)
-            elif side == "short" and new_stop < current_stop - 10 and new_stop > entry:
-                updates["stop"] = round(new_stop, 1)
-
-        # Target improvement: long → higher is better (must stay > entry);
-        # short → lower is better (must stay < entry).
-        if new_target is not None and current_target is not None and entry:
-            if side == "long" and new_target > current_target + 10 and new_target > entry:
-                updates["target"] = round(new_target, 1)
-            elif side == "short" and new_target < current_target - 10 and new_target < entry:
-                updates["target"] = round(new_target, 1)
-
-        if updates:
-            update_cols = ", ".join(f"{k}=?" for k in updates)
-            vals = list(updates.values()) + [sim_pos["id"]]
-            conn.execute(f"UPDATE positions SET {update_cols} WHERE id=?", vals)
-            conn.commit()
 
 
 def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
@@ -1180,7 +1001,7 @@ def manage_simulated_position(conn, data: dict, current_price: float):
     Strict priority chain:
       1. Stop loss
       2. Take profit
-      3. PnL trailing stop (every 5% profit, lock 5% into stop)
+      3. PnL trailing stop (dual strategy: <30% lock 50% profit, >=30% fixed 10% pullback)
       4. Emergency exit (high volatility + opposite, ADX dead)
       4.5. Circuit breaker (flash crash, liquidation cascade, tighten stop if in profit)
       5. Signal reversal
@@ -1236,35 +1057,59 @@ def manage_simulated_position(conn, data: dict, current_price: float):
         # Positions held beyond their expected duration without strong signal
         # conviction → exit. Prevents stale positions from lingering through
         # changed market conditions.
-        # Slow strategies (low_vol_trend, macro_bias) get longer leeway.
-        # Fast strategies (breakout, reversal, aggressive) exit sooner.
+        #
+        # Timeouts are sized for 4h cycle: a full trend wave (forming → trending
+        # → exhaustion) typically runs 5-10 days (120-240h), so 48h is too short.
+        #
+        # Profit override: if leveraged PnL ≥ 5%, skip the timeout even with
+        # weak signal — let profits run, only cut "stale + unprofitable" positions.
         created_at = sim_pos.get("created_at") or 0
         signal_type = sim_pos.get("signal_type") or ""
         holding_hours = (now - created_at) / 3600
 
         if signal_type in ("low_vol_trend", "macro_bias_long"):
-            max_hours = 96  # 4 days for slow strategies
+            max_hours = 120  # 5 days for slow strategies (was 96h)
             strong_confidence = 50
             strong_strength = ("强", "中等")
         elif signal_type in ("ranging_breakout", "exhaustion_reversal", "aggressive_adx7_early"):
-            max_hours = 24  # fast in, fast out
+            max_hours = 36  # 1.5 days for fast strategies (was 24h)
             strong_confidence = 60
             strong_strength = ("强",)
         else:
-            max_hours = 48  # default
+            max_hours = 72  # 3 days for default trend-following (was 48h)
             strong_confidence = 50
             strong_strength = ("强", "中等")
 
         if holding_hours >= max_hours:
-            confidence = verdict.get("confidence", 0)
-            strength = verdict.get("strength", "")
-            weak_signal = confidence < strong_confidence or strength not in strong_strength
-            if weak_signal:
-                close_simulated_position(
-                    conn, sim_pos, current_price,
-                    f"max_hold_time: {holding_hours:.1f}h, conf={confidence}, strength={strength}",
-                )
-                return
+            # Profit override: if position ever reached >= 5% leveraged profit,
+            # don't force-exit. Let trailing stop protect it.
+            # Use price extreme (min_price for short, max_price for long) to
+            # avoid penalizing momentary price fluctuations.
+            entry = sim_pos.get("entry_price") or 0
+            leverage = sim_pos.get("leverage") or 20
+            side = sim_pos.get("side")
+            if entry > 0:
+                # Calculate best-ever pnl from recorded price extreme
+                if side == "long":
+                    best_price = sim_pos.get("max_price") or current_price
+                    best_pnl = (best_price - entry) / entry * 100 * leverage
+                else:
+                    best_price = sim_pos.get("min_price") or current_price
+                    best_pnl = (entry - best_price) / entry * 100 * leverage
+
+                if best_pnl >= 5:
+                    # Position was profitable at some point — let it run
+                    pass
+                else:
+                    confidence = verdict.get("confidence", 0)
+                    strength = verdict.get("strength", "")
+                    weak_signal = confidence < strong_confidence or strength not in strong_strength
+                    if weak_signal:
+                        close_simulated_position(
+                            conn, sim_pos, current_price,
+                            f"max_hold_time: {holding_hours:.1f}h, conf={confidence}, strength={strength}, best_pnl={best_pnl:.1f}%",
+                        )
+                        return
 
         _manage_open_position(conn, sim_pos, verdict, current_price, now)
     else:

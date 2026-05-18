@@ -1109,6 +1109,12 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
                 {{ simPnl >= 0 ? '+' : '' }}{{ simPnl.toFixed(2) }}%
               </div>
             </div>
+            <div class="sim-stat" v-if="simPosition.realized_pnl && simPosition.realized_pnl !== 0">
+              <div class="sim-stat-label">已实现盈亏</div>
+              <div class="sim-stat-value" :class="simPosition.realized_pnl >= 0 ? 'up' : 'down'">
+                {{ simPosition.realized_pnl >= 0 ? '+' : '' }}{{ simPosition.realized_pnl.toFixed(2) }} U
+              </div>
+            </div>
             <div class="sim-stat" v-if="simPosition.target">
               <div class="sim-stat-label">目标</div>
               <div class="sim-stat-value" style="color:#22c55e">{{ fmt(simPosition.target) }}</div>
@@ -1177,7 +1183,7 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
                 <td style="font-family:monospace">{{ histPositionSize(h) }} BTC</td>
                 <td style="font-family:monospace">{{ histMargin(h) }} U</td>
                 <td>{{ h.leverage }}x</td>
-                <td v-if="h.action === 'close' || h.action === 'close_stop' || h.action === 'close_tp'" :class="(h.pnl||0) >= 0 ? 'up' : 'down'" style="font-weight:700">
+                <td v-if="h.action.startsWith('close') || h.action.includes('reduce') || h.action === 'exit'" :class="(h.pnl||0) >= 0 ? 'up' : 'down'" style="font-weight:700">
                   {{ (h.pnl||0) >= 0 ? '+' : '' }}{{ (h.pnl||0).toFixed(2) }} U
                 </td>
                 <td v-else style="color:#6b7280">-</td>
@@ -1631,7 +1637,7 @@ createApp({
       const a = h.action || '';
       if (a === 'open') return '开仓';
       if (a.startsWith('add')) return '加仓';
-      if (a.startsWith('reduce')) return '减仓';
+      if (a.includes('reduce')) return '减仓';
       if (a.startsWith('close') || a === 'exit') return '平仓';
       return a;
     };
@@ -1639,7 +1645,7 @@ createApp({
       const a = h.action || '';
       if (a === 'open') return '#60a5fa';
       if (a.startsWith('add')) return '#fbbf24';
-      if (a.startsWith('reduce')) return '#f87171';
+      if (a.includes('reduce')) return '#f87171';
       return '#ef4444';
     };
     const histPrice = (h) => h.price || h.entry_price || h.close_price || 0;
@@ -1670,11 +1676,12 @@ createApp({
       const a = h.action || '';
       if (a === 'open') return h.entry_reason || '-';
       if (a.startsWith('add')) return `加仓 ${h.position_size?.toFixed(4) || '-'} BTC`;
-      if (a.startsWith('reduce')) return `减仓 ${h.position_size?.toFixed(4) || '-'} BTC`;
+      if (a.includes('reduce')) return `减仓 ${h.position_size?.toFixed(4) || '-'} BTC`;
       return simCloseReasonText(h.close_reason) || '-';
     };
     const histStatus = (h) => {
       if (h.action === 'open') return h.status === 'closed' ? '已平' : '持仓中';
+      if (h.action.includes('reduce')) return '减仓已确认';
       return '-';
     };
 

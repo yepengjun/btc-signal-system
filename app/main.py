@@ -818,17 +818,28 @@ async def api_record_action(position_id: int, request: Request):
     action = body.get("action")  # add/reduce/exit
     adx_4h = body.get("adx_4h")
     price = body.get("price")
+    position_size = body.get("position_size")  # BTC quantity for add/reduce
     now = time.time()
 
     conn.execute(
-        "INSERT INTO position_action_state (position_id, action, adx_4h, price, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (position_id, action, adx_4h, price, now),
+        "INSERT INTO position_action_state (position_id, action, adx_4h, price, position_size, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (position_id, action, adx_4h, price, position_size, now),
     )
 
-    # Update position's action_state and max_adx
-    if action == "reduce":
+    # Update position's action_state, and adjust size/pnl for reduce
+    if "reduce" in action:
         conn.execute("UPDATE positions SET action_state = 'reduced' WHERE id = ?", (position_id,))
+        # Adjust position size and record realized pnl
+        current_size = row.get("position_size") or 0
+        new_size = current_size - (position_size or 0)
+        entry = row.get("entry_price") or 0
+        realized_pnl = (price - entry) * position_size if row["side"] == "long" and entry and position_size else (entry - price) * position_size if row["side"] == "short" and entry and position_size else 0
+        cum_pnl = (row.get("realized_pnl") or 0) + realized_pnl
+        conn.execute(
+            "UPDATE positions SET position_size=?, realized_pnl=? WHERE id=?",
+            (round(new_size, 6), round(cum_pnl, 2), position_id),
+        )
     elif action == "exit":
         conn.execute("UPDATE positions SET action_state = 'exited', status = 'closed', updated_at = ? WHERE id = ?", (now, position_id))
     else:
@@ -881,14 +892,18 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
 
     offset = (page - 1) * page_size
 
-    # Each open position = 1 row (open). Each closed position = 2 rows (open + close).
+    # Each open position = 1 row (open) + reduce rows. Each closed position = 2 rows (open + close) + reduce rows.
+    # Count reduce actions for pagination total
+    reduce_count = conn.execute(
+        "SELECT COUNT(*) FROM position_action_state WHERE action LIKE 'reduce_%' OR action IN ('decay_reduce', 'decay_reduce_loss')"
+    ).fetchone()[0]
     total = conn.execute("""
         SELECT COUNT(*) FROM positions
         WHERE is_simulated = 1 AND status = 'open'
     """).fetchone()[0] + conn.execute("""
         SELECT COUNT(*) * 2 FROM positions
         WHERE is_simulated = 1 AND status = 'closed'
-    """).fetchone()[0]
+    """).fetchone()[0] + reduce_count
 
     # Fetch open positions first
     open_rows = conn.execute("""
@@ -910,7 +925,7 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
         ORDER BY closed_at DESC
     """).fetchall()
 
-    # Build rows: for each closed position produce open+close, for open produce only open
+    # Build rows
     all_records = []
     for r in open_rows:
         rd = dict(r)
@@ -919,7 +934,47 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
         rd["action_type"] = "open"
         rd["price"] = rd["entry_price"]
         rd["duration_hours"] = None
+        # Override position_size with original size from open action (current size may be reduced)
+        orig = conn.execute(
+            "SELECT position_size FROM position_action_state "
+            "WHERE position_id = ? AND action = 'open' LIMIT 1",
+            (rd["id"],),
+        ).fetchone()
+        if orig:
+            rd["position_size"] = orig["position_size"]
         all_records.append(rd)
+
+        # Inject reduce rows for this open position
+        if rd["reduce_count"] and rd["reduce_count"] > 0:
+            reduces = conn.execute(
+                "SELECT action, price, position_size, created_at, adx_4h "
+                "FROM position_action_state WHERE position_id = ? "
+                "AND (action LIKE 'reduce_%' OR action IN ('decay_reduce', 'decay_reduce_loss')) "
+                "ORDER BY created_at",
+                (rd["id"],),
+            ).fetchall()
+            orig = conn.execute(
+                "SELECT position_size FROM position_action_state "
+                "WHERE position_id = ? AND action = 'open' LIMIT 1",
+                (rd["id"],),
+            ).fetchone()
+            prev_size = orig["position_size"] if orig else rd["position_size"]
+            entry = rd["entry_price"]
+            side = rd["side"]
+            for red in reduces:
+                reduced_amt = red["position_size"]
+                pnl = round((red["price"] - entry) * reduced_amt if side == "long" else (entry - red["price"]) * reduced_amt, 2)
+                red_rec = dict(rd)
+                red_rec["action"] = red["action"]
+                red_rec["action_type"] = "reduce"
+                red_rec["price"] = red["price"]
+                red_rec["created_at"] = red["created_at"]
+                red_rec["position_size"] = reduced_amt
+                red_rec["pnl"] = pnl
+                red_rec["action_id"] = None
+                red_rec["duration_hours"] = None
+                all_records.append(red_rec)
+                prev_size = reduced_amt
 
     for r in closed_rows:
         rd = dict(r)
@@ -931,6 +986,38 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
         open_rec["action_type"] = "open"
         open_rec["price"] = open_rec["entry_price"]
         all_records.append(open_rec)
+
+        # Inject reduce rows for this closed position
+        if rd["reduce_count"] and rd["reduce_count"] > 0:
+            reduces = conn.execute(
+                "SELECT action, price, position_size, created_at, adx_4h "
+                "FROM position_action_state WHERE position_id = ? "
+                "AND (action LIKE 'reduce_%' OR action IN ('decay_reduce', 'decay_reduce_loss')) "
+                "ORDER BY created_at",
+                (rd["id"],),
+            ).fetchall()
+            orig = conn.execute(
+                "SELECT position_size FROM position_action_state "
+                "WHERE position_id = ? AND action = 'open' LIMIT 1",
+                (rd["id"],),
+            ).fetchone()
+            prev_size = orig["position_size"] if orig else rd["position_size"]
+            entry = rd["entry_price"]
+            side = rd["side"]
+            for red in reduces:
+                reduced_amt = red["position_size"]
+                pnl = round((red["price"] - entry) * reduced_amt if side == "long" else (entry - red["price"]) * reduced_amt, 2)
+                red_rec = dict(rd)
+                red_rec["action"] = red["action"]
+                red_rec["action_type"] = "reduce"
+                red_rec["price"] = red["price"]
+                red_rec["created_at"] = red["created_at"]
+                red_rec["position_size"] = reduced_amt
+                red_rec["pnl"] = pnl
+                red_rec["action_id"] = None
+                red_rec["duration_hours"] = None
+                all_records.append(red_rec)
+                prev_size = reduced_amt
 
         # Close row
         close_rec = dict(rd)
@@ -981,7 +1068,7 @@ async def api_simulated_position_stats(request: Request):
     ).fetchone()
     realized_pnl = closed_pnl + (row["open_realized_pnl"] or 0)
 
-    # Today's PnL: closed positions since start of today (UTC+8)
+    # Today's PnL: closed positions since start of today (UTC+8) + realized PnL from open positions
     import time as _time
     now = _time.time()
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
@@ -994,6 +1081,13 @@ async def api_simulated_position_stats(request: Request):
     ).fetchone()
     today_pnl = row["today_pnl"]
     today_trades = row["today_trades"]
+
+    # Add realized PnL from open positions (partial reduces not captured in closed query)
+    row = conn.execute(
+        "SELECT COALESCE(SUM(realized_pnl), 0) as open_realized_pnl "
+        "FROM positions WHERE is_simulated = 1 AND status = 'open'"
+    ).fetchone()
+    today_pnl += (row["open_realized_pnl"] or 0)
 
     # Current balance = initial + realized PnL
     initial_balance = settings.sim_initial_balance

@@ -3272,20 +3272,14 @@ def generate_verdict(
             side = "多" if h4["direction"] == "bullish" else ("空" if h4["direction"] == "bearish" else "观望")
             reason = "4h 衰竭但 1h 趋势延续，可能是回调而非反转"
         else:
-            # Direction was flipped in multi-TF rules → reversal signal
+            # Direction was flipped in multi-TF rules → reversal signal.
+            # Cooldown already handled in alignment rules: when in cooldown,
+            # h4["signal_type"] is NOT set to "exhaustion_reversal", so we
+            # naturally fall through to the "trend exhaustion" branch below.
             flipped_dir = h4["direction"]
             is_reversal = h4.get("signal_type") == "exhaustion_reversal"
             h30_confirms = (h30["direction"] == flipped_dir) if h30["direction"] else False
-            recent_reversals = market_ctx.get("recent_reversals", [])
-            in_cooldown = any(
-                time.time() - rr["created_at"] < 3600
-                for rr in recent_reversals if rr["direction"] == flipped_dir
-            )
-            if in_cooldown:
-                action = "衰竭反转冷却中"
-                side = "观望"
-                reason = f"4h趋势衰竭，但1h内已发过{('看' + ('涨' if flipped_dir == 'bullish' else '跌'))}反转信号，冷却中等待确认"
-            elif h30_confirms and is_reversal:
+            if h30_confirms and is_reversal:
                 action = f"衰竭反转早期信号（轻仓试{'涨' if flipped_dir == 'bullish' else '跌'}）"
                 side = "多" if flipped_dir == "bullish" else ("空" if flipped_dir == "bearish" else "观望")
                 reason = f"4h趋势衰竭（ADX={h4['adx']:.0f}动量减弱），30m已确认{'看涨' if flipped_dir == 'bullish' else '看跌'}方向，可轻仓试探反转"
@@ -3503,17 +3497,18 @@ def generate_verdict(
         else round(current_price + stop_distance, 1)
     )
 
-    # Apply aggressive overrides
-    if _aggressive_stop is not None:
-        stop = _aggressive_stop
-    if _aggressive_target is not None:
-        target = _aggressive_target
-
-    # Apply Stage 1 overrides: stop/target based on 30m ATR (RR ≥ 1.2)
+    # Apply stop/target overrides (mutually exclusive in practice:
+    # Stage 1 and aggressive signals never both trigger because Stage 1
+    # sets side first, blocking aggressive. But order matters for safety.)
+    # Priority: Stage 1 > Aggressive > default forecast
     if _stage1_stop is not None:
         stop = _stage1_stop
+    elif _aggressive_stop is not None:
+        stop = _aggressive_stop
     if _stage1_target is not None:
         target = _stage1_target
+    elif _aggressive_target is not None:
+        target = _aggressive_target
 
     # Final guard: ensure stop maintains minimum distance from entry price
     # (catches aggressive/stage1 overrides that could produce stops too close)
@@ -3696,7 +3691,7 @@ def generate_verdict(
             side = "观望"
             entry_action = "wait"
             entry_note = f"现价盈亏比过低（{current_rr:.2f}），价格已偏离入场位，等待回调至 {entry_price:.0f} 附近再入场（目标 {target:.0f}，止损 {stop:.0f}）"
-            base_pct = round(2.0 / max(rr, 1), 1)
+            base_pct = round(max(1.0, 2.0 / max(rr, 1)), 1)
             leverage_num = int(base_leverage)
             risk_price_pct = risk / max(entry_price, 1) * 100
             max_safe_pct = 2.0 / max(leverage_num * risk_price_pct / 100, 0.01)
@@ -3720,7 +3715,7 @@ def generate_verdict(
                 "confidence": _order_confidence(rr, confidence),
             }
         else:
-            base_pct = round(2.0 / max(rr, 1), 1)
+            base_pct = round(max(1.0, 2.0 / max(rr, 1)), 1)
             leverage_num = int(base_leverage)
             risk_price_pct = risk / max(entry_price, 1) * 100
             max_safe_pct = 2.0 / max(leverage_num * risk_price_pct / 100, 0.01)
@@ -3764,7 +3759,7 @@ def generate_verdict(
             side = "观望"
             entry_action = "wait"
             entry_note = f"现价盈亏比过低（{current_rr:.2f}），价格已偏离入场位，等待反弹至 {entry_price:.0f} 附近再入场（目标 {target:.0f}，止损 {stop:.0f}）"
-            base_pct = round(2.0 / max(rr, 1), 1)
+            base_pct = round(max(1.0, 2.0 / max(rr, 1)), 1)
             leverage_num = int(base_leverage)
             risk_price_pct = risk / max(entry_price, 1) * 100
             max_safe_pct = 2.0 / max(leverage_num * risk_price_pct / 100, 0.01)
@@ -3788,7 +3783,7 @@ def generate_verdict(
                 "confidence": _order_confidence(rr, confidence),
             }
         else:
-            base_pct = round(2.0 / max(rr, 1), 1)
+            base_pct = round(max(1.0, 2.0 / max(rr, 1)), 1)
             leverage_num = int(base_leverage)
             risk_price_pct = risk / max(entry_price, 1) * 100
             max_safe_pct = 2.0 / max(leverage_num * risk_price_pct / 100, 0.01)

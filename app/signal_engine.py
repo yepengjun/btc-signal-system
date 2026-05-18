@@ -40,7 +40,7 @@ def _analyze_position_state(
     price = h4["price"]
 
     # Check for DI crossover (exit signal)
-    di_crossover = _check_di_crossover(history_rows)
+    di_crossover = _check_di_crossover(history_rows, h4)
 
     # Check for price divergence (price new high but ADX not new high)
     price_divergence = _check_price_divergence(history_rows, position, h4)
@@ -90,6 +90,17 @@ def _analyze_position_state(
                     "target": h4.get("forecast", {}).get("target_conserv"),
                     "stop": None,
                 }
+            # Half-confirmation: 1h forming + same direction — allow opening
+            # with reduced conviction (lower risk_pct in auto-open).
+            if h1_regime == "forming" and h1_dir == direction:
+                return {
+                    "action": "开仓（低波动趋势·1h形成中）",
+                    "side": "做多" if direction == 'bullish' else "做空",
+                    "level": "open",
+                    "reason": f"4h低波动趋势{'看涨' if direction == 'bullish' else '看跌'}，1h趋势正在形成同向",
+                    "target": h4.get("forecast", {}).get("target_conserv"),
+                    "stop": None,
+                }
             return {
                 "action": "低波动趋势未确认，建议观望",
                 "level": "wait",
@@ -113,76 +124,71 @@ def _analyze_position_state(
     max_adx = position.get("max_adx") or adx4
 
     di_diff = abs(h4["plus_di"] - h4["minus_di"])
+    adx_change = adx4 - entry_adx
+    adx_from_peak = adx4 - max_adx
 
-    # Multi-TF exhaustion reduce: 30m + 1h both exhaustion with same direction as position
-    # Short-term pullback risk is high even if 4h is still trending
+    # Collect reduce conditions and take max ratio.
+    # When multiple risk conditions fire simultaneously (e.g. high volatility
+    # + exhaustion), we want the most severe response, not the first match.
+    # Exit conditions are still checked independently below.
+    reduce_conditions: list[tuple[float, str, str, str]] = []  # (ratio, action, reason, reduce_type)
+
     h30_regime = h30.get("regime", "")
     h1_regime = h1.get("regime", "")
     h30_dir = h30.get("direction")
     h1_dir = h1.get("direction")
 
+    # Multi-TF exhaustion reduce: 30m + 1h both exhaustion with same direction as position
+    # Short-term pullback risk is high even if 4h is still trending
     if h30_regime == "exhaustion" and h1_regime == "exhaustion":
         if pos_dir == direction and h30_dir == pos_dir and h1_dir == pos_dir:
-            # Volume confirmation: only reduce if 30m volume is low (缩量衰竭)
-            # Normal/high volume exhaustion is less reliable
             h30_vol = h30.get("vol_percentile", 50)
             h1_vol = h1.get("vol_percentile", 50)
-
-            # If 30m is low volume (< 20) and 1h is not high volume (< 70),
-            # this is genuine 缩量衰竭 → reduce
-            # If 30m has normal/high volume, exhaustion is less reliable → skip
             if h30_vol < 30 and h1_vol < 70:
-                return {
-                    "action": "减仓保护利润（多周期短期衰竭）",
-                    "level": "reduce",
-                    "reduce_type": "30pct",
-                    "reason": f"30m和1h同时衰竭且30m缩量（30m ADX={h30.get('adx', 0):.0f} 量能{h30_vol:.0f}%），短期回调风险大，建议减仓锁定利润",
-                    "target": None,
-                    "stop": None,
-                }
+                ratio = _calc_reduce_ratio(max(h30_vol, h1_vol))
+                reduce_conditions.append((
+                    ratio,
+                    f"减仓保护利润（多周期短期衰竭，减{int(ratio*100)}%）",
+                    f"30m和1h同时衰竭且30m缩量（30m ADX={h30.get('adx', 0):.0f} 量能{h30_vol:.0f}%），短期回调风险大",
+                    f"{int(ratio*100)}pct",
+                ))
 
-    adx_change = adx4 - entry_adx
-    adx_from_peak = adx4 - max_adx
     aligned = (pos_dir == direction) and regime in ("trending", "low_vol_trend")
 
     # HIGH VOLATILITY: market enters high volatility → suggest reduce for protection
-    if regime == "high_volatility" and pos_dir == direction:
+    if regime == "high_volatility":
         atr_pct = h4.get("atr_pct", 0)
-        reduce_ratio = _calc_reduce_ratio(h4.get("vol_percentile", 50))
-        return {
-            "action": f"减仓保护利润（减{int(reduce_ratio*100)}%）",
-            "level": "reduce",
-            "reduce_type": f"{int(reduce_ratio*100)}pct",
-            "reason": f"市场进入高波动状态（ATR%={atr_pct:.2f}），建议减仓{int(reduce_ratio*100)}%降低风险",
-            "target": None,
-            "stop": None,
-        }
-
-    # HIGH VOLATILITY + opposite direction → exit
-    if regime == "high_volatility" and pos_dir != direction:
-        return {
-            "action": "平仓离场",
-            "level": "exit",
-            "reason": f"高波动状态且方向不利，建议立即离场",
-            "target": None,
-            "stop": None,
-        }
-
-    # EXHAUSTION: trend losing steam → suggest take profit
-    vol_pct = h4.get("vol_percentile", 50)
-    if regime == "exhaustion":
+        vol_pct_hv = h4.get("vol_percentile", 50)
+        ratio = _calc_reduce_ratio(vol_pct_hv)
         if pos_dir == direction:
-            # Volume-aware: low volume exhaustion = more reliable, reduce more
-            reduce_ratio = _calc_reduce_ratio(vol_pct)
-            vol_note = "缩量" if vol_pct < 20 else "放量" if vol_pct > 60 else "正常量能"
+            reduce_conditions.append((
+                ratio,
+                f"减仓保护利润（高波动，减{int(ratio*100)}%）",
+                f"市场进入高波动状态（ATR%={atr_pct:.2f}，波动率分位={vol_pct_hv:.0f}%）",
+                f"{int(ratio*100)}pct",
+            ))
+        else:
+            # Opposite direction + high volatility → exit
             return {
-                "action": f"减仓获利（减{int(reduce_ratio*100)}%）",
-                "level": "reduce",
-                "reduce_type": f"{int(reduce_ratio*100)}pct",
-                "reason": f"趋势正在衰竭（ADX={adx4:.0f} 量能{vol_note}），建议先减仓{int(reduce_ratio*100)}%锁定利润",
+                "action": "平仓离场",
+                "level": "exit",
+                "reason": f"高波动状态且方向不利，建议立即离场",
                 "target": None,
                 "stop": None,
             }
+
+    # EXHAUSTION: trend losing steam → suggest take profit
+    if regime == "exhaustion":
+        vol_pct = h4.get("vol_percentile", 50)
+        if pos_dir == direction:
+            ratio = _calc_reduce_ratio(vol_pct)
+            vol_note = "缩量" if vol_pct < 20 else "放量" if vol_pct > 60 else "正常量能"
+            reduce_conditions.append((
+                ratio,
+                f"减仓获利（减{int(ratio*100)}%）",
+                f"趋势正在衰竭（ADX={adx4:.0f} 量能{vol_note}）",
+                f"{int(ratio*100)}pct",
+            ))
         else:
             return {
                 "action": "平仓离场",
@@ -224,9 +230,9 @@ def _analyze_position_state(
     # BREAKOUT: new trend starting → good for position
     if regime == "breakout" and pos_dir == direction:
         # Use same strict add criteria as trending add-on (line 324)
-        can_add = adx4 >= 25 and adx_change >= 2 and momentum == "加速" and _confirm_add_signal(h4, position, price, h4.get("vol_percentile", 50))
+        can_add = adx4 >= 25 and (adx_change >= 2 or adx4 >= 40) and momentum == "加速" and _confirm_add_signal(h4, position, price, h4.get("vol_percentile", 50))
         return {
-            "action": "继续持有",
+            "action": "继续持有" + ("，满足加仓条件" if can_add else ""),
             "level": "add" if can_add else "hold",
             "reason": f"市场突破盘整，{'看涨' if direction == 'bullish' else '看跌'}趋势启动",
             "target": h4.get("forecast", {}).get("target_conserv"),
@@ -295,8 +301,9 @@ def _analyze_position_state(
             "stop": None,
         }
 
-    # REDUCE: ADX dropped significantly from peak, or DI narrowed, or price divergence
-    if (adx_from_peak <= -adx_drop_reduce and max_adx >= 30) or di_diff < 5 or price_divergence:
+    # REDUCE: ADX dropped significantly from peak, or DI narrowed, or price divergence.
+    # Threshold raised: max_adx >= 35 (was 30) to reduce false triggers from normal ADX noise.
+    if (adx_from_peak <= -adx_drop_reduce and max_adx >= 35) or di_diff < 5 or price_divergence:
         if position.get("reduced"):
             return {
                 "action": "清仓离场",
@@ -305,25 +312,41 @@ def _analyze_position_state(
                 "target": None,
                 "stop": None,
             }
-        reduce_ratio = _calc_reduce_ratio(h4.get("vol_percentile", 50))
+        ratio = _calc_reduce_ratio(h4.get("vol_percentile", 50))
         reason_parts = []
-        if adx_from_peak <= -adx_drop_reduce and max_adx >= 30:
+        if adx_from_peak <= -adx_drop_reduce and max_adx >= 35:
             reason_parts.append(f"ADX从峰值{max_adx:.0f}回落至{adx4:.0f}")
         if di_diff < 5:
             reason_parts.append(f"DI差值缩小至{di_diff:.1f}，方向确定性降低")
         if price_divergence:
             reason_parts.append("价格新高但ADX未创新高（背离）")
+        reduce_conditions.append((
+            ratio,
+            f"减仓保护利润（减{int(ratio*100)}%）",
+            "；".join(reason_parts),
+            f"{int(ratio*100)}pct",
+        ))
+
+    # ─── Resolve reduce conditions: take max ratio ───
+    if reduce_conditions:
+        best_ratio, best_action, best_reason, best_type = max(reduce_conditions, key=lambda x: x[0])
+        # Combine reasons if multiple conditions triggered
+        if len(reduce_conditions) > 1:
+            all_reasons = [rc[2] for rc in reduce_conditions]
+            combined_reason = " | ".join(all_reasons)
+        else:
+            combined_reason = best_reason
         return {
-            "action": f"减仓保护利润（减{int(reduce_ratio*100)}%）",
+            "action": best_action,
             "level": "reduce",
-            "reduce_type": f"{int(reduce_ratio*100)}pct",
-            "reason": "；".join(reason_parts),
+            "reduce_type": best_type,
+            "reason": combined_reason,
             "target": None,
             "stop": None,
         }
 
     # ADD: ADX rising, momentum accelerating, price making new high/low + strict confirmation
-    if adx4 >= 25 and adx_change >= 2 and momentum == "加速":
+    if adx4 >= 25 and (adx_change >= 2 or adx4 >= 40) and momentum == "加速":
         vol_pct = h4.get("vol_percentile", 50)
         if _confirm_add_signal(h4, position, price, vol_pct):
             return {
@@ -345,12 +368,18 @@ def _analyze_position_state(
 
 
 def _is_fresh_trend(history_rows: list) -> bool:
-    """Check if current trend is fresh (not trending in last 3 history entries)."""
+    """Check if current trend is fresh (not trending in last 3 history entries).
+
+    Fresh = 0 or 1 of the last 3 entries were "trending".
+    "low_vol_trend" does NOT count as trending (it's a forming/continuation stage, not established momentum).
+    Established = 2+ of 3 pure "trending" — trend has been running, do NOT open new positions.
+    """
     if not history_rows:
         return True
     recent = history_rows[:3]
+    # Only pure "trending" counts — "low_vol_trend" is continuation, not established
     trending_count = sum(1 for r in recent if r.get("regime") == "trending")
-    return trending_count < 2
+    return trending_count < 2  # block when 2+ of last 3 were pure trending
 
 
 def _check_forming_confirmation(history_rows: list, current_direction: str) -> bool:
@@ -390,12 +419,50 @@ def _check_position_direction_mismatch(
         if hist_dir and hist_dir != pos_dir:
             mismatch += 1
 
+    # If current 4h direction also disagrees, force exit regardless of history
+    if current_4h_dir and current_4h_dir != pos_dir:
+        mismatch = max(mismatch + 1, 2)  # floor at 2 for forced exit
+
     should_exit = mismatch >= 2
     return should_exit, mismatch
 
 
-def _check_di_crossover(history_rows: list) -> bool:
-    """Check if DI+ and DI- have crossed over in recent history."""
+def _check_di_crossover(history_rows: list, h4: dict | None = None) -> bool:
+    """Check if DI+ and DI- have crossed over recently.
+
+    Primary: use DI series from 4h timeframe to detect actual crossover
+    (plus_di crossing minus_di). A single-period crossover is not enough —
+    we also check that the DI spread remains narrow for confirmation.
+
+    Fallback: use verdict_history direction flips when DI series unavailable.
+    """
+    # Prefer actual DI series from the 4h timeframe
+    if h4 and h4.get("plus_di_series") and h4.get("minus_di_series"):
+        pdi = h4["plus_di_series"]
+        mdi = h4["minus_di_series"]
+        n = min(len(pdi), len(mdi))
+        if n >= 2:
+            # Check last 2 periods for actual DI crossover
+            pdi_now, mdi_now = pdi[-1], mdi[-1]
+            pdi_prev, mdi_prev = pdi[-2], mdi[-2]
+            cross_bullish = pdi_prev <= mdi_prev and pdi_now > mdi_now
+            cross_bearish = pdi_prev >= mdi_prev and pdi_now < mdi_now
+            if cross_bullish or cross_bearish:
+                # Confirm: current spread should still be narrow enough
+                current_spread = abs(pdi_now - mdi_now)
+                if current_spread < 10:  # crossover confirmed, spread still tight
+                    return True
+            # Near-convergence without full crossover: spread < 3 = dangerous zone
+            if abs(pdi_now - mdi_now) < 3:
+                # Check if direction flipped in history for confirmation
+                for i in range(min(2, len(history_rows) - 1)):
+                    if history_rows[i].get("direction") and history_rows[i + 1].get("direction"):
+                        if history_rows[i]["direction"] != history_rows[i + 1]["direction"]:
+                            return True
+
+        return False
+
+    # Fallback: use verdict direction flips
     if len(history_rows) < 2:
         return False
     for i in range(min(2, len(history_rows) - 1)):
@@ -418,7 +485,10 @@ def _check_price_divergence(history_rows: list, position: dict | None, h4: dict)
     historical_prices = [r["price"] for r in history_rows if r.get("price") is not None and r["price"] > 0]
     peak_price = max(historical_prices) if historical_prices else 0
 
-    if peak_adx > 0 and current_price >= peak_price * 0.995 and current_adx < peak_adx - 5:
+    # Price must be near recent peak (within 0.2%, ~$156 at $78k) AND ADX
+    # must have dropped meaningfully (>= 8 points) — tight tolerance avoids
+    # false divergence from normal volatility.
+    if peak_adx > 0 and current_price >= peak_price * 0.998 and current_adx < peak_adx - 8:
         return True
     return False
 
@@ -442,12 +512,18 @@ def _get_peak_adx_from_history(history_rows: list) -> float:
 
 
 def _is_price_extreme(position: dict, current_price: float) -> bool:
-    """Check if price is making a new extreme (high for long, low for short)."""
-    entry_price = position.get("entry_price", current_price)
+    """Check if price is making a new extreme relative to the position's peak.
+
+    Uses max_price (highest price seen during position) for longs, or
+    min_price for shorts, so add-on signals fire on genuine breakouts
+    rather than just being above/below entry after a retracement.
+    """
     if position.get("side") == "long":
-        return current_price > entry_price * 1.005
+        benchmark = position.get("max_price") or position.get("entry_price", current_price)
+        return current_price > benchmark * 1.005
     else:
-        return current_price < entry_price * 0.995
+        benchmark = position.get("min_price") or position.get("entry_price", current_price)
+        return current_price < benchmark * 0.995
 
 
 def _confirm_add_signal(
@@ -465,9 +541,14 @@ def _confirm_add_signal(
     if h4.get("momentum") != "加速":
         return False
 
-    # 3. ADX rising from entry
+    # 3. ADX rising from entry, OR already very high (>= 40).
+    # At ADX >= 40, absolute +2 is hard — trend strength is implied by
+    # the high level itself. This prevents missing adds in mature trends
+    # where ADX naturally plateaus.
     entry_adx = position.get("entry_adx") or h4["adx"]
-    if h4["adx"] < entry_adx + 2:
+    if h4["adx"] >= 40:
+        pass  # ADX already very high, no further rise required
+    elif h4["adx"] < entry_adx + 2:
         return False
 
     # 4. Volatility not at extreme (don't add at vol_percentile > 85)
@@ -478,15 +559,23 @@ def _confirm_add_signal(
 
 
 def _calc_reduce_ratio(vol_percentile: float) -> float:
-    """Dynamic reduce ratio based on volatility severity.
+    """Unified dynamic reduce ratio for all reduce conditions.
 
-    Returns fraction of position to reduce (0.25 ~ 0.75).
+    Uses linear interpolation between tiers to avoid abrupt jumps:
+    vol <= 75% → 25%, vol 75-90% → 25-50%, vol > 90% → 50-75%.
+
+    Called by: multi-TF exhaustion, high volatility, trend exhaustion,
+    ADX drop / DI narrowing / price divergence.
+    When multiple conditions fire, the caller takes max ratio.
     """
-    if vol_percentile > 90:
-        return 0.75  # severe volatility → reduce 75%
-    if vol_percentile > 75:
-        return 0.50  # high volatility → reduce 50%
-    return 0.25  # moderate → reduce 25%
+    if vol_percentile <= 75:
+        return 0.25
+    if vol_percentile <= 90:
+        # Linear interpolation: 25% at 75, 50% at 90
+        return 0.25 + (vol_percentile - 75) / 15 * 0.25
+    # vol > 90: interpolate from 50% to 75%
+    cap = min(vol_percentile, 100)
+    return 0.50 + (cap - 90) / 10 * 0.25
 
 
 def _detect_macro_bull(candles_4h: list[dict], h4: dict) -> dict:
@@ -498,14 +587,14 @@ def _detect_macro_bull(candles_4h: list[dict], h4: dict) -> dict:
     on short timeframes are likely pullback traps.
 
     Returns dict with is_bull, is_bear, ema50, price_vs_ema50_pct, di_bias,
-    is_bull_pullback, pullback_depth_pct, reason.
+    is_bull_pullback, is_bear_pullback, pullback_depth_pct, reason.
     """
     closes = [c["close"] for c in candles_4h]
     highs = [c["high"] for c in candles_4h]
     if len(closes) < 50:
         return {"is_bull": False, "is_bear": False, "ema50": 0, "price_vs_ema50_pct": 0,
-                "di_bias": "neutral", "is_bull_pullback": False, "pullback_depth_pct": 0,
-                "reason": "数据不足"}
+                "di_bias": "neutral", "is_bull_pullback": False, "is_bear_pullback": False,
+                "pullback_depth_pct": 0, "reason": "数据不足"}
 
     ema50_vals = calc_ema(closes, 50)
     ema50 = ema50_vals[-1]
@@ -547,10 +636,27 @@ def _detect_macro_bull(candles_4h: list[dict], h4: dict) -> dict:
             and pullback_depth_pct > 0.3):
         is_bull_pullback = True
 
+    # ─── Bear pullback (shallow rally in established bear market) ───
+    # Symmetric to bull pullback: recent low was well below EMA50,
+    # and the rally from that low is shallow (< 3.5%).
+    lows = [c["low"] for c in candles_4h]
+    lookback_bear = min(48, len(lows))
+    recent_low = min(lows[-lookback_bear:])
+    rally_depth_pct = (current_price - recent_low) / max(recent_low, 1) * 100
+    low_vs_ema50 = (ema50 - recent_low) / max(ema50, 1) * 100
+
+    is_bear_pullback = False
+    if (low_vs_ema50 > 1.0
+            and rally_depth_pct < 3.5
+            and rally_depth_pct > 0.3):
+        is_bear_pullback = True
+
     if is_bull:
         reason = f"宏观看涨：价格高于EMA50 (+{price_vs_ema50_pct:.1f}%), +DI={plus_di:.0f} > -DI={minus_di:.0f}"
+    elif is_bear and is_bear_pullback:
+        reason = f"宏观看跌（浅反弹）：价格低于EMA50 ({price_vs_ema50_pct:.1f}%), 但从近期低点仅反弹 {rally_depth_pct:.1f}%, 前期低点低于EMA50 {low_vs_ema50:.1f}%"
     elif is_bear and is_bull_pullback:
-        reason = f"宏观看涨回调：价格低于EMA50 ({price_vs_ema50_pct:.1f}%), 但从近期高点仅回撤 {pullback_depth_pct:.1f}%, 前期高点高于EMA50 {high_vs_ema50:.1f}%"
+        reason = f"宏观看跌（牛拉回穿越EMA50）：价格低于EMA50 ({price_vs_ema50_pct:.1f}%), 但牛拉回浅 ({pullback_depth_pct:.1f}%), 前期高点高于EMA50 {high_vs_ema50:.1f}%"
     elif is_bear:
         reason = f"宏观看跌：价格低于EMA50 ({price_vs_ema50_pct:.1f}%), -DI={minus_di:.0f} > +DI={plus_di:.0f}"
     else:
@@ -563,6 +669,7 @@ def _detect_macro_bull(candles_4h: list[dict], h4: dict) -> dict:
         "price_vs_ema50_pct": round(price_vs_ema50_pct, 2),
         "di_bias": di_bias,
         "is_bull_pullback": is_bull_pullback,
+        "is_bear_pullback": is_bear_pullback,
         "pullback_depth_pct": round(pullback_depth_pct, 2),
         "reason": reason,
     }
@@ -661,8 +768,11 @@ def _detect_breakout(
     lows = [c["low"] for c in candles]
 
     # Price breaking 20-candle range by at least ATR (not just touching)
-    recent_high = max(highs[-21:-1]) if len(highs) >= 21 else max(highs[:-1])
-    recent_low = min(lows[-21:-1]) if len(lows) >= 21 else min(lows[:-1])
+    # Require at least 21 candles for meaningful 20-candle range comparison
+    if len(highs) < 21:
+        return False  # insufficient data for breakout detection
+    recent_high = max(highs[-21:-1])
+    recent_low = min(lows[-21:-1])
     current = closes[-1]
     price_breakout = (current > recent_high + atr_val) or (current < recent_low - atr_val)
 
@@ -689,12 +799,13 @@ def _detect_exhaustion(
     adx_slow: float,
     vol_percentile: float,
 ) -> bool:
-    """Detect trend exhaustion — trend still above threshold but losing steam.
+    """Detect trend exhaustion — trend losing steam after running strong.
 
     Conditions (all must be met):
-    1. ADX >= 35 (raised from 30 — was in STRONG trend, not just moderate)
-    2. Momentum is "减弱" or "衰竭"
-    3. ADX actually declining: adx_fast < adx_slow (ADX falling = trend weakening)
+    1. ADX >= 30 (lowered from 35 — exhaustion starts earlier)
+    2. Momentum weakening: momentum in ("减弱", "衰竭")
+       OR adx_fast < adx_slow + 2 (ADX flattening/declining)
+    3. ADX actually declining: adx_fast < adx_slow (trend weakening)
 
     Volume confirmation:
     - Low volume (vol_percentile < 15): exhaustion more reliable (缩量衰竭)
@@ -703,32 +814,47 @@ def _detect_exhaustion(
     If momentum says "衰竭" but ADX is still rising (adx_fast > adx_slow + 2),
     the trend is still strengthening — not exhaustion.
     """
-    if adx < 35:
-        return False
-    if momentum not in ("减弱", "衰竭"):
+    if adx < 30:
         return False
 
-    # ADX must actually be declining, not just slowing down.
-    # adx_fast(10) < adx_slow(21) means ADX is genuinely falling (trend weakening)
-    # adx_fast > adx_slow means ADX is rising (trend strengthening) — NOT exhaustion
-    if adx_fast >= adx_slow:
-        return False  # ADX still rising or flat — trend strengthening
+    # ADX must be declining, not rising. If adx_fast > adx_slow + 2,
+    # trend is still strengthening — NOT exhaustion.
+    if adx_fast > adx_slow + 2:
+        return False  # ADX still rising — trend strengthening
 
-    # ADX peak drop confirmation
-    if dx_series and len(dx_series) >= 10:
-        peak_dx = max(dx_series[-10:])
+    # With ADX declining confirmed, check momentum weakening.
+    # Either explicit momentum flag OR implicit from fast/slow ADX gap.
+    momentum_weakening = (
+        momentum in ("减弱", "衰竭")
+        or adx_fast < adx_slow  # ADX genuinely falling
+    )
+    if not momentum_weakening:
+        return False
+
+    # DX peak drop confirmation: compare current DX to recent max.
+    # Works with as few as 3 data points; uses up to 10 for stability.
+    if dx_series and len(dx_series) >= 3:
+        lookback = min(10, len(dx_series))
+        peak_dx = max(dx_series[-lookback:])
         current_dx = dx_series[-1]
-        if peak_dx - current_dx >= 5:  # raised from 3 to 5
+        # Scale threshold by lookback: fewer points = require bigger drop
+        dx_drop_threshold = 5 if lookback >= 10 else 3
+        if peak_dx - current_dx >= dx_drop_threshold:
             return True  # ADX dropped significantly from peak
 
-    # Without sufficient peak drop, require momentum == "衰竭" AND low volume
+    # Without sufficient peak drop, require momentum == "衰竭" or low volume
     if momentum == "衰竭" and vol_percentile < 50:
+        return True
+
+    # High ADX + ADX declining but momentum not yet "衰竭":
+    # if ADX is very high (>= 45), even mild weakening is meaningful
+    if adx >= 45 and adx_fast < adx_slow - 1:
         return True
 
     return False
 
 
-def _analyze_single_timeframe(candles: list[dict], timeframe: str, thresholds: dict | None = None) -> dict:
+def _analyze_single_timeframe(candles: list[dict], timeframe: str, thresholds: dict | None = None, previous_regime: str | None = None, previous_direction: str | None = None) -> dict:
     """Analyze a single timeframe and return analysis dict."""
     thresholds = thresholds or {}
     base_trending = thresholds.get("adx_trending_threshold", 25)
@@ -789,7 +915,7 @@ def _analyze_single_timeframe(candles: list[dict], timeframe: str, thresholds: d
     # false acceleration signals during rapid reversals where raw DX
     # may spike then crash, misleading the momentum calculation.
     dx_len = len(dx_series)
-    momentum = "稳定"
+    raw_momentum = "稳定"
     if dx_len >= 6:
         # 2-period EMA smoothing
         ema_dx = [dx_series[0]]
@@ -799,24 +925,26 @@ def _analyze_single_timeframe(candles: list[dict], timeframe: str, thresholds: d
         earlier_avg = sum(ema_dx[-6:-3]) / 3
         diff = recent_avg - earlier_avg
         if diff > 3:
-            momentum = "加速"
+            raw_momentum = "加速"
         elif diff > 0.5:
-            momentum = "稳定"
+            raw_momentum = "稳定"
         elif diff > -2:
-            momentum = "减弱"
+            raw_momentum = "减弱"
         else:
-            momentum = "衰竭"
+            raw_momentum = "衰竭"
 
-    # Override: if ADX_fast > adx_slow, trend is genuinely strengthening.
-    # DX momentum may be slowing but the trend itself is still building up.
-    # Don't show "衰竭" when ADX is rising — misleading for users.
+    # Display-adjusted momentum: if ADX_fast > adx_slow, trend is genuinely
+    # strengthening. DX momentum may be slowing but the trend itself is still
+    # building up. Don't show "衰竭" when ADX is rising — misleading for users.
+    # But pass raw_momentum to _detect_exhaustion for accurate detection.
+    momentum = raw_momentum
     if adx_fast > adx_slow + 3 and momentum in ("衰竭", "减弱"):
         momentum = "减弱" if adx_fast - adx_slow < 8 else "稳定"
 
     is_high_vol = _detect_high_volatility(candles, atr_pct, adx, plus_di, minus_di, volumes)
     is_low_vol = _detect_low_volatility(atr_pct, adx, plus_di, minus_di, volumes, adx_forming)
     is_breakout = _detect_breakout(candles, atr_pct, adx, plus_di, minus_di, volumes, atr_val)
-    is_exhaustion = _detect_exhaustion(adx, momentum, dx_series, adx_fast, adx_slow, vol_percentile)
+    is_exhaustion = _detect_exhaustion(adx, raw_momentum, dx_series, adx_fast, adx_slow, vol_percentile)
 
     # Regime detection with correct priority:
     # 1. exhaustion    — ADX≥30 + momentum declining + ADX actually falling
@@ -854,6 +982,31 @@ def _analyze_single_timeframe(candles: list[dict], timeframe: str, thresholds: d
         else:
             regime = "ranging"
 
+    # ─── Regime hysteresis: prevent flickering between regimes across cycles ───
+    # Require stronger evidence when switching away from an established regime.
+    # This avoids whipsaw between similar states (e.g., trending ↔ forming)
+    # when ADX hovers near the threshold boundary.
+    if previous_regime and regime != previous_regime:
+        _regime_strength = {
+            "trending": 4, "breakout": 3, "exhaustion": 4,
+            "low_vol_trend": 3, "high_volatility": 3,
+            "forming": 2, "low_volatility": 1, "ranging": 1,
+        }
+        new_strength = _regime_strength.get(regime, 0)
+        old_strength = _regime_strength.get(previous_regime, 0)
+        # If the new regime is weaker or only marginally different, stay with the old one.
+        # EXCEPTION: when momentum == "衰竭" + ADX dropping, force switch to exhaustion
+        # even if hysteresis would block it — this fixes the late exhaustion detection
+        # that causes trend-following signals at the end of trends.
+        is_forced_exhaustion = (
+            regime == "exhaustion"
+            and previous_regime in ("trending", "low_vol_trend")
+            and momentum == "衰竭"
+            and adx_fast < adx_slow
+        )
+        if not is_forced_exhaustion and new_strength <= old_strength and adx < adx_trending + 5:
+            regime = previous_regime
+
     # DI spread filter: reject directional signals if DI spread too small
     di_spread = abs(plus_di - minus_di)
     min_di_spread = thresholds.get("min_di_spread", 3)
@@ -874,10 +1027,11 @@ def _analyze_single_timeframe(candles: list[dict], timeframe: str, thresholds: d
         di_spread_history.insert(0, di_spread_history[0] if di_spread_history else di_spread)
 
     # DI spread converging: last 3 spread values are strictly decreasing
+    # and the latest is < 70% of the first (catches gradual convergence).
     di_spread_converging = False
     if len(di_spread_history) >= 3:
         last3 = di_spread_history[-3:]
-        di_spread_converging = (last3[0] > last3[1] > last3[2]) and last3[2] < last3[0] * 0.5
+        di_spread_converging = (last3[0] > last3[1] > last3[2]) and last3[2] < last3[0] * 0.7
 
     # For short timeframes (30m, 1h), require larger DI spread.
     # Make spread threshold proportional to ADX: low ADX = lower spread bar,
@@ -890,12 +1044,30 @@ def _analyze_single_timeframe(candles: list[dict], timeframe: str, thresholds: d
         effective_min_di = min_di_spread
 
     if di_spread < effective_min_di and regime in ("trending", "forming", "low_vol_trend"):
-        regime = "ranging"
-        direction = None
+        # Require di_spread to be CLEARLY below threshold to override regime.
+        # A 0.5-point dead zone prevents flickering when spread hovers near
+        # effective_min_di (e.g., 2.9 vs 3.0).
+        DI_SPREAD_DEAD_ZONE = 0.5
+        if di_spread < effective_min_di - DI_SPREAD_DEAD_ZONE:
+            regime = "ranging"
+            direction = None
 
-    # Direction
+    # Direction with hysteresis: require a minimum DI spread to flip direction.
+    # Prevents long→short→long whipsaw when +DI and -DI are within 1 point.
+    DIR_DEAD_ZONE = 1.0
+    di_diff = plus_di - minus_di
+
     if regime in ("trending", "forming", "breakout", "exhaustion", "low_vol_trend"):
-        direction = "bullish" if plus_di > minus_di else "bearish"
+        if previous_direction:
+            # Require crossing the dead zone to flip
+            if previous_direction == "bullish" and di_diff < -DIR_DEAD_ZONE:
+                direction = "bearish"
+            elif previous_direction == "bearish" and di_diff > DIR_DEAD_ZONE:
+                direction = "bullish"
+            else:
+                direction = previous_direction  # stay in dead zone
+        else:
+            direction = "bullish" if di_diff > DIR_DEAD_ZONE else ("bearish" if di_diff < -DIR_DEAD_ZONE else None)
     else:
         direction = None
 
@@ -943,8 +1115,10 @@ def _analyze_single_timeframe(candles: list[dict], timeframe: str, thresholds: d
     else:
         strength = "无"
 
-    # Duration: how many candles in current trend
+    # Duration: how many candles in current trend (not applicable for non-directional regimes)
     duration_hours = _estimate_duration(candles, timeframe, thresholds)
+    if regime in ("ranging", "low_volatility"):
+        duration_hours = None
 
     # Price structure analysis
     price_structure = _analyze_price_structure(candles)
@@ -1033,12 +1207,14 @@ def _estimate_duration(candles: list[dict], timeframe: str, thresholds: dict = N
     period = thresholds.get("adx_period", 14)
     alpha = 1.0 / period
 
-    # Seed with SMA of first `period` DM values (indices 1..period)
-    plus_smooth = sum(plus_dm[1:period + 1]) / period
-    minus_smooth = sum(minus_dm[1:period + 1]) / period
+    # Seed with SMA of first `period` DM values (indices 0..period-1).
+    # Index 0 is always 0.0 (no previous candle), so including it is correct.
+    plus_smooth = sum(plus_dm[0:period]) / max(period, 1)
+    minus_smooth = sum(minus_dm[0:period]) / max(period, 1)
 
     # Build DI ratio series: plus_di / (plus_di + minus_di)
     di_ratios = [0.5] * n
+    # EMA smoothing starts from period index; values before that use the seed.
     for i in range(1, n):
         plus_smooth = alpha * plus_dm[i] + (1 - alpha) * plus_smooth
         minus_smooth = alpha * minus_dm[i] + (1 - alpha) * minus_smooth
@@ -1247,10 +1423,11 @@ def _calc_forecast(
     move_pct = move_so_far / start_price * 100
     is_bullish = move_so_far >= 0
 
-    adx_peak = adx_data["adx"]
-    if adx_peak >= 30:
+    # ADX strength scaling factor (uses current ADX, not historical peak)
+    adx_strength = adx
+    if adx_strength >= 30:
         factor = 1.5
-    elif adx_peak >= 25:
+    elif adx_strength >= 25:
         factor = 1.2
     else:
         factor = 0.8
@@ -1268,12 +1445,14 @@ def _calc_forecast(
     k_vol = 1.0 + (vol_percentile / 100)  # 1.0 ~ 2.0
     k_adx = max(0.8, min(1.5, 1.0 - (adx - 25) / 50))  # ADX high → tighter stop
     stop_distance = atr * 1.5 * k_vol * k_adx
+    # Minimum stop distance: 0.15% of price prevents zero/tiny stops
+    stop_distance = max(stop_distance, current_price * 0.0015)
 
     return {
         "momentum": "稳定",
-        "adx_peak": adx_peak,
+        "adx_current": adx_strength,
         "adx_drop": 0.0,
-        "adx_recent_peak": adx_peak,
+        "adx_recent_peak": adx_strength,
         "atr": round(atr, 1),
         "trend_start_price": round(start_price, 1),
         "move_so_far": round(move_so_far, 1),
@@ -1381,7 +1560,8 @@ def _detect_bb_squeeze_detail(candles: list[dict], atr: float) -> dict | None:
     lower = sma20 - 2 * std
     band_width = upper - lower
 
-    if band_width >= atr * 2:
+    # Use same threshold as _check_squeeze (atr * 1.5) for consistency
+    if band_width >= atr * 1.5:
         return None
 
     all_closes = [c["close"] for c in candles]
@@ -1453,9 +1633,8 @@ def _detect_double_pattern(candles_1h: list[dict], candles_30m: list[dict], atr_
                     continue
                 current_price = closes[-1]
                 if current_price < neckline:
-                    continue  # not yet broken through
-
                     # === Double Top ===
+                    # Price broke below neckline — bearish breakdown confirmed
                     pattern_height = highs[sh1] - neckline
 
                     # Anti-chase: if price dropped too far below neckline, skip
@@ -1572,7 +1751,8 @@ def _check_aggressive_1h_trend(h4, h1, h30, all_thresholds) -> dict | None:
 
 def _check_failed_pullback(h4, h1, h30, all_candles_4h) -> dict | None:
     """Strategy 2: Failed pullback continuation."""
-    if h4["regime"] != "trending":
+    # Allow in directional regimes where 1h pullbacks are meaningful
+    if h4["regime"] not in ("trending", "low_vol_trend", "breakout", "forming", "low_volatility"):
         return None
     orig_dir = h4["direction"]
     if not orig_dir:
@@ -1678,11 +1858,13 @@ def _check_squeeze_breakout(h4, h1, h30, candles_1h) -> dict | None:
     }
 
 
-def _check_volume_spike(h4, h1, h30) -> dict | None:
+def _check_volume_spike(h4, h1, h30, candles_30m=None, candles_1h=None) -> dict | None:
     """Strategy 4: Volume spike breakout — independent volume-driven signal."""
-    for tf_name, min_move_pct in [("30m", 0.003), ("1h", 0.005)]:
-        tf_candles = fetch_klines(settings.binance_symbol, tf_name, limit=25)
-        if len(tf_candles) < 25:
+    for tf_name, min_move_pct, tf_candles in [
+        ("30m", 0.003, candles_30m or fetch_klines(settings.binance_symbol, "30m", limit=25)),
+        ("1h", 0.005, candles_1h or fetch_klines(settings.binance_symbol, "1h", limit=25)),
+    ]:
+        if tf_candles is None or len(tf_candles) < 25:
             continue
         vols = [c["volume"] for c in tf_candles]
         avg_vol = sum(vols[:-1]) / max(len(vols) - 1, 1)
@@ -1739,10 +1921,12 @@ def _check_volume_spike(h4, h1, h30) -> dict | None:
     return None
 
 
-def _check_pattern_breakout(h4, h1, h30, macro=None) -> dict | None:
+def _check_pattern_breakout(h4, h1, h30, candles_1h=None, candles_30m=None, macro=None) -> dict | None:
     """Strategy 5: Double top/bottom breakout — pure price pattern signal."""
-    candles_1h = fetch_klines(settings.binance_symbol, "1h", limit=25)
-    candles_30m = fetch_klines(settings.binance_symbol, "30m", limit=30)
+    if candles_1h is None:
+        candles_1h = fetch_klines(settings.binance_symbol, "1h", limit=25)
+    if candles_30m is None:
+        candles_30m = fetch_klines(settings.binance_symbol, "30m", limit=30)
     pattern = _detect_double_pattern(candles_1h, candles_30m, atr_1h=h1.get("atr", 0), atr_30m=h30.get("atr", 0))
     if not pattern:
         return None
@@ -1760,7 +1944,8 @@ def _check_pattern_breakout(h4, h1, h30, macro=None) -> dict | None:
             return None
 
     return {
-        "signal_type": pattern["type"],
+        "signal_type": "aggressive_pattern_breakout",
+        "pattern_subtype": pattern["type"],
         "direction": pattern["direction"],
         "direction_label": pattern["direction_label"],
         "action": f"形态突破（{pattern['timeframe']} {pattern['direction_label']}）",
@@ -1778,15 +1963,17 @@ def _check_pattern_breakout(h4, h1, h30, macro=None) -> dict | None:
     }
 
 
-def _check_volatility_expansion(h4, h1, h30) -> dict | None:
+def _check_volatility_expansion(h4, h1, h30, candles_30m=None, candles_1h=None) -> dict | None:
     """Strategy 6: Volatility expansion — sudden ATR spike + large one-way move.
 
     Conditions: 30m ATR > 20-bar avg × 2 AND price moved > 500 points one-way;
     closes near extreme; 4h not in strong opposite trend.
     """
-    for tf_name in ["30m", "1h"]:
-        tf_candles = fetch_klines(settings.binance_symbol, tf_name, limit=25)
-        if len(tf_candles) < 25:
+    for tf_name, tf_candles in [
+        ("30m", candles_30m or fetch_klines(settings.binance_symbol, "30m", limit=25)),
+        ("1h", candles_1h or fetch_klines(settings.binance_symbol, "1h", limit=25)),
+    ]:
+        if tf_candles is None or len(tf_candles) < 25:
             continue
 
         highs = [c["high"] for c in tf_candles]
@@ -1804,7 +1991,7 @@ def _check_volatility_expansion(h4, h1, h30) -> dict | None:
         if atr_avg == 0 or current_atr < atr_avg * 2:
             continue
 
-        # Price movement: last candle one-way move > 500 points
+        # Price movement: last candle one-way move > 0.5% of price (adaptive to BTC level)
         last = tf_candles[-1]
         move_up = last["high"] - last["open"]
         move_down = last["open"] - last["low"]
@@ -1812,7 +1999,8 @@ def _check_volatility_expansion(h4, h1, h30) -> dict | None:
 
         # Use the larger directional move (not total range)
         directional_move = move_up if close_high else move_down
-        if directional_move < 500:
+        directional_move_pct = directional_move / max(last["open"], 1) * 100
+        if directional_move_pct < 0.5:
             continue
 
         # Close must be near extreme (>70% of candle in that direction)
@@ -1851,12 +2039,12 @@ def _check_volatility_expansion(h4, h1, h30) -> dict | None:
             "confidence": 42,
             "position_pct": 8,
             "entry_type": "market",
-            "entry_note": f"{tf_name} ATR突增（{current_atr/atr_avg:.1f}x均值），单向波动{directional_move:.0f}点",
+            "entry_note": f"{tf_name} ATR突增（{current_atr/atr_avg:.1f}x均值），单向幅度{directional_move_pct:.2f}%",
             "stop": stop,
             "target": target,
             "reason": (
                 f"{tf_name}波动率爆发（当前ATR={current_atr:.0f} > 20根均值={atr_avg:.0f} 的2倍），"
-                f"价格单向移动{directional_move:.0f}点，"
+                f"价格单向移动{directional_move_pct:.2f}%，"
                 f"收盘接近{'最高' if bullish else '最低'}，"
                 f"4h未明确反对"
             ),
@@ -1864,16 +2052,18 @@ def _check_volatility_expansion(h4, h1, h30) -> dict | None:
     return None
 
 
-def _check_momentum_accel(h4, h1, h30) -> dict | None:
+def _check_momentum_accel(h4, h1, h30, candles_30m=None, candles_1h=None) -> dict | None:
     """Strategy 7: Momentum acceleration — catch drops/rally in progress.
 
     Detects when 3+ consecutive candles move in same direction with
     cumulative drop/rally > 500 points AND the last candle is expanding.
     Fires BEFORE ADX confirms, capturing the middle section of fast moves.
     """
-    for tf_name in ["30m", "1h"]:
-        tf_candles = fetch_klines(settings.binance_symbol, tf_name, limit=15)
-        if len(tf_candles) < 6:
+    for tf_name, tf_candles in [
+        ("30m", candles_30m or fetch_klines(settings.binance_symbol, "30m", limit=15)),
+        ("1h", candles_1h or fetch_klines(settings.binance_symbol, "1h", limit=15)),
+    ]:
+        if tf_candles is None or len(tf_candles) < 6:
             continue
 
         # Check last 3-5 candles for consecutive directional movement
@@ -1910,8 +2100,9 @@ def _check_momentum_accel(h4, h1, h30) -> dict | None:
             else:
                 continue
 
-        # Total directional move must exceed 500 points
-        if cumulative_move < 500:
+        # Total directional move must exceed 0.5% of price
+        move_pct_check = cumulative_move / max(tf_candles[-1]["open"], 1) * 100
+        if move_pct_check < 0.5:
             continue
 
         # Volume expansion on last candle: > 1.5x average of previous 5
@@ -1940,11 +2131,11 @@ def _check_momentum_accel(h4, h1, h30) -> dict | None:
         # Stop: beyond the extreme of the run; target: 1x cumulative move extension
         if is_bearish:
             run_high = max(c["high"] for c in tf_candles[-5:])
-            stop = round(run_high + h1["atr"] * 0.3, 1)
+            stop = round(run_high + h1["atr"] * 0.6, 1)
             target = round(last["close"] - cumulative_move, 1)
         else:
             run_low = min(c["low"] for c in tf_candles[-5:])
-            stop = round(run_low - h1["atr"] * 0.3, 1)
+            stop = round(run_low - h1["atr"] * 0.6, 1)
             target = round(last["close"] + cumulative_move, 1)
 
         return {
@@ -1956,12 +2147,12 @@ def _check_momentum_accel(h4, h1, h30) -> dict | None:
             "confidence": 45,
             "position_pct": 8,
             "entry_type": "market",
-            "entry_note": f"{tf_name}连续{max(bearish_count, bullish_count)}根{'阴' if is_bearish else '阳'}线，累计移动{cumulative_move:.0f}点",
+            "entry_note": f"{tf_name}连续{max(bearish_count, bullish_count)}根{'阴' if is_bearish else '阳'}线，累计移动{move_pct_check:.2f}%",
             "stop": stop,
             "target": target,
             "reason": (
                 f"{tf_name}动量加速：连续{max(bearish_count, bullish_count)}根同向K线，"
-                f"累计{'下跌' if is_bearish else '上涨'}{cumulative_move:.0f}点，"
+                f"累计{'下跌' if is_bearish else '上涨'}{move_pct_check:.2f}%，"
                 f"最后一根放量（{last_vol/avg_vol:.1f}x均值），"
                 f"4h未明确反对"
             ),
@@ -1969,7 +2160,7 @@ def _check_momentum_accel(h4, h1, h30) -> dict | None:
     return None
 
 
-def _check_adx7_early(h4, h1, h30, all_thresholds) -> dict | None:
+def _check_adx7_early(h4, h1, h30, candles_30m=None, candles_1h=None, all_thresholds=None) -> dict | None:
     """Strategy 8: Fast ADX early warning — catch trend startup before ADX confirms.
 
     Uses per-TF fast ADX period + DI crossover for earliest trend detection.
@@ -1980,11 +2171,14 @@ def _check_adx7_early(h4, h1, h30, all_thresholds) -> dict | None:
         for tf in tf_fast_periods:
             tf_fast_periods[tf] = all_thresholds["tf_thresholds"].get(tf, {}).get("adx_fast_period", tf_fast_periods[tf])
 
-    for tf_name in ["30m", "1h"]:
-        fast_p = tf_fast_periods.get(tf_name, 10)
-        tf_candles = fetch_klines(settings.binance_symbol, tf_name, limit=20)
-        if len(tf_candles) < 15:
+    for tf_name, tf_candles in [
+        ("30m", candles_30m or fetch_klines(settings.binance_symbol, "30m", limit=20)),
+        ("1h", candles_1h or fetch_klines(settings.binance_symbol, "1h", limit=20)),
+    ]:
+        if tf_candles is None or len(tf_candles) < 15:
             continue
+
+        fast_p = tf_fast_periods[tf_name]
 
         highs = [c["high"] for c in tf_candles]
         lows = [c["low"] for c in tf_candles]
@@ -2026,11 +2220,11 @@ def _check_adx7_early(h4, h1, h30, all_thresholds) -> dict | None:
         if direction == "bearish" and h4["regime"] == "trending" and h4["direction"] == "bullish":
             continue
 
-        # Tight stop: 0.3% or ATR×1, whichever is smaller
+        # Stop: 0.5% or 1x ATR, whichever is larger — avoids whipsaw on normal noise
         current_price = closes[-1]
         atr1h = h1["atr"]
-        tight_stop_pct = current_price * 0.003
-        tight_stop = min(tight_stop_pct, atr1h * 0.8)
+        stop_pct = current_price * 0.005
+        tight_stop = max(stop_pct, atr1h * 1.0)
         if di_cross_bullish:
             stop = round(current_price - tight_stop, 1)
             target = round(current_price + tight_stop * 3, 1)
@@ -2046,6 +2240,7 @@ def _check_adx7_early(h4, h1, h30, all_thresholds) -> dict | None:
             "side": side,
             "confidence": 30,
             "position_pct": 5,
+            "leverage": 10,
             "entry_type": "market",
             "entry_note": f"ADX({fast_p}) DI金叉（{tf_name}），ADX={adx_now['adx']:.1f} +DI={adx_now['plus_di']:.0f} vs -DI={adx_now['minus_di']:.0f}",
             "stop": stop,
@@ -2053,7 +2248,7 @@ def _check_adx7_early(h4, h1, h30, all_thresholds) -> dict | None:
             "reason": (
                 f"{tf_name} ADX({fast_p}) 早期预警：DI交叉翻转（+DI={adx_now['plus_di']:.0f} {'>' if di_cross_bullish else '<'} -DI={adx_now['minus_di']:.0f}），"
                 f"ADX({fast_p})={adx_now['adx']:.1f} 正在上升，"
-                f"超早期试探性入场（仓位5%，杠杆5x，止损{tight_stop:.0f}）"
+                f"超早期试探性入场（仓位5%，杠杆10x，止损{tight_stop:.0f}）"
             ),
         }
     return None
@@ -2061,6 +2256,7 @@ def _check_adx7_early(h4, h1, h30, all_thresholds) -> dict | None:
 
 def _check_aggressive_signals(
     h4, h1, h30, all_candles_4h, all_thresholds, market_ctx, macro,
+    pre_fetched_candles: dict | None = None,
 ) -> dict | None:
     """Evaluate all aggressive strategies, return the most appropriate one.
 
@@ -2085,16 +2281,23 @@ def _check_aggressive_signals(
         "aggressive_failed_pullback",
     }
 
+    # Helper: get pre-fetched candles or fetch on demand
+    _candles_30m = None
+    _candles_1h = None
+    if pre_fetched_candles:
+        _candles_30m = pre_fetched_candles.get("30m")
+        _candles_1h = pre_fetched_candles.get("1h")
+
     fires = []
     for stype, checker in [
         ("aggressive_1h_trend", lambda: _check_aggressive_1h_trend(h4, h1, h30, all_thresholds)),
         ("aggressive_failed_pullback", lambda: _check_failed_pullback(h4, h1, h30, all_candles_4h)),
-        ("aggressive_squeeze_breakout", lambda: _check_squeeze_breakout(h4, h1, h30, fetch_klines(settings.binance_symbol, "1h", limit=25))),
-        ("aggressive_volume_spike", lambda: _check_volume_spike(h4, h1, h30)),
-        ("aggressive_pattern_breakout", lambda: _check_pattern_breakout(h4, h1, h30, macro)),
-        ("aggressive_volatility_expansion", lambda: _check_volatility_expansion(h4, h1, h30)),
-        ("aggressive_momentum_accel", lambda: _check_momentum_accel(h4, h1, h30)),
-        ("aggressive_adx7_early", lambda: _check_adx7_early(h4, h1, h30, all_thresholds)),
+        ("aggressive_squeeze_breakout", lambda: _check_squeeze_breakout(h4, h1, h30, _candles_1h or fetch_klines(settings.binance_symbol, "1h", limit=25))),
+        ("aggressive_volume_spike", lambda: _check_volume_spike(h4, h1, h30, _candles_30m, _candles_1h)),
+        ("aggressive_pattern_breakout", lambda: _check_pattern_breakout(h4, h1, h30, _candles_1h or fetch_klines(settings.binance_symbol, "1h", limit=25), _candles_30m or fetch_klines(settings.binance_symbol, "30m", limit=30), macro)),
+        ("aggressive_volatility_expansion", lambda: _check_volatility_expansion(h4, h1, h30, _candles_30m, _candles_1h)),
+        ("aggressive_momentum_accel", lambda: _check_momentum_accel(h4, h1, h30, _candles_30m, _candles_1h)),
+        ("aggressive_adx7_early", lambda: _check_adx7_early(h4, h1, h30, _candles_30m, _candles_1h, all_thresholds)),
     ]:
         if cooldowns.get(stype, False):
             continue
@@ -2135,12 +2338,15 @@ def generate_verdict(
     position: dict | None = None,
     market_context: dict | None = None,
     pre_fetched_klines: dict | None = None,
+    previous_regimes: dict | None = None,
 ) -> dict:
     """Multi-timeframe analysis verdict with circuit breaker and funding/OI filter.
 
     Args:
         pre_fetched_klines: optional dict mapping timeframe to list[candle dict],
             allows caller to pass pre-fetched candles (e.g. from parallel fetch).
+        previous_regimes: optional dict mapping timeframe to previous cycle's regime,
+            used for hysteresis to prevent regime flickering.
     """
     # Load evolved thresholds so signal engine self-adjusts
     all_thresholds = get_active_thresholds()
@@ -2174,7 +2380,9 @@ def generate_verdict(
         for k, v in all_thresholds.items():
             if k not in tf_thresholds and k not in ("tf_thresholds",):
                 tf_thresholds[k] = v
-        results[tf] = _analyze_single_timeframe(candles, tf, tf_thresholds)
+        prev_regimes = previous_regimes or {}
+        prev_direction = prev_regimes.get(f"{tf}_direction")
+        results[tf] = _analyze_single_timeframe(candles, tf, tf_thresholds, previous_regime=prev_regimes.get(tf), previous_direction=prev_direction)
         if tf == "4h":
             all_candles_4h = candles
 
@@ -2278,8 +2486,9 @@ def generate_verdict(
         # Don't set circuit breaker; instead, reduce confidence later
         pass  # confidence adjustment handled in alignment rules
 
-    # DI spread too low
-    if h4.get("di_spread", 0) < all_thresholds.get("min_di_spread", 3) and not circuit_breaker_reason:
+    # DI spread too low (with hysteresis dead zone to prevent flickering)
+    _min_di = all_thresholds.get("min_di_spread", 3)
+    if h4.get("di_spread", 0) < _min_di - 0.5 and not circuit_breaker_reason:
         circuit_breaker_reason = f"DI价差过低（{h4['di_spread']:.1f}），趋势不可靠"
 
     # Liquidation cascade detection (BTC-specific):
@@ -2295,10 +2504,19 @@ def generate_verdict(
             if price_change > 5 and avg_vol > 0 and latest_vol > avg_vol * 3:
                 circuit_breaker_reason = f"清算级联：24h 波动 {price_change:.1f}% + 量能 {latest_vol/avg_vol:.1f}x"
 
+    # ─── Check previous decay state (for hysteresis) ───
+    # Prevents DECAYING from flickering on/off when metrics hover near thresholds.
+    # Once DECAYING fires, it requires stronger improvement to clear.
+    prev_was_decaying = False
+    if history_rows and len(history_rows) >= 1:
+        prev_advice = (history_rows[0].get("advice") or "")
+        # "观望（跌趋势衰减中）" or similar contains "衰减" when DECAYING active
+        prev_was_decaying = "衰减" in prev_advice
+
     # ─── Trend Exhaustion & Late-Trend Filters ───────────────────────────
     # Three-tier decay model (not binary block):
     #   NONE      — no decay, normal entries
-    #   DECAYING  — trend weakening but still valid, allow with reduced risk (1%)
+    #   DECAYING  — trend weakening, block entries, wait for direction confirmation
     #   EXHAUSTED — trend over (ADI extreme or below threshold), block entries
     trend_decay_level = "NONE"  # NONE | DECAYING | EXHAUSTED
     exhaustion_reason = None
@@ -2409,6 +2627,18 @@ def generate_verdict(
             if bearish_count >= 2 and long_upper:
                 trend_decay_level = "DECAYING"
                 exhaustion_reason = "价格结构反转：连续阴线+长上影，看涨动能衰减"
+
+    # ─── DECAYING Hysteresis ───
+    # Prevents flickering when metrics hover near thresholds. Once DECAYING
+    # fires, require stronger improvement to clear: ADX must be at least
+    # trending threshold AND DI spread must be wide enough.
+    if prev_was_decaying and trend_decay_level == "NONE":
+        h4_di_spread = abs(h4["plus_di"] - h4["minus_di"])
+        adx_recovered = h4["adx"] >= h4_adx_threshold and h4_di_spread >= 8
+        if not adx_recovered:
+            # Still in decay — don't clear
+            trend_decay_level = "DECAYING"
+            exhaustion_reason = exhaustion_reason or f"上一周期处于衰减状态，指标未充分恢复（ADX={h4['adx']:.0f}, DI差={h4_di_spread:.0f}）"
 
     # ─── Filter 5: DI Convergence Warning ──────────────────────────────
     # Detect trend weakening BEFORE exhaustion kicks in.
@@ -2525,6 +2755,7 @@ def generate_verdict(
     h4_reg = h4["regime"]
     h1_reg = h1["regime"]
     orig_h4_direction = h4["direction"]  # save before potential flip
+    _dir_override_log = []  # track direction flips for debugging
 
     # Track if this is a "forming quality signal" — 4h forming but 1h strongly trending.
     # Used in action advice to allow controlled entry instead of blanket wait.
@@ -2570,6 +2801,7 @@ def generate_verdict(
             # Lower confidence but still allow — weak opposition
             alignment_rule += "（4h方向与1h轻微相反，降低仓位）"
             h4["direction"] = h1["direction"]
+            _dir_override_log.append(f"P2: {orig_h4_direction} → {h1['direction']} (1h forming override)")
             h4_forming_quality = True
             confidence = max(30, h1["confidence"] - 10)
             stage_1_warning = {
@@ -2587,6 +2819,7 @@ def generate_verdict(
         else:
             # 4h direction matches or is None — 1h trend is trustworthy
             h4["direction"] = h1["direction"]
+            _dir_override_log.append(f"P2: {orig_h4_direction} → {h1['direction']} (1h forming match)")
             h4_forming_quality = True
             confidence = max(35, h1["confidence"] - 5)
             # Stage 1: early trend startup signal
@@ -2609,6 +2842,7 @@ def generate_verdict(
         alignment_rule = "规则2b: 4h+1h 同时 forming 同向确认"
         h4_forming_quality = True
         h4["direction"] = h1["direction"]  # ensure alignment
+        _dir_override_log.append(f"P2b: {orig_h4_direction} → {h1['direction']} (4h+1h forming same dir)")
         confidence = max(30, h4["confidence"] - 5)
         # Stage 1: light entry
         stage_1_warning = {
@@ -2663,8 +2897,9 @@ def generate_verdict(
 
         if (h1_reg in ("trending", "breakout", "forming") and h1_dir
                 and h30_dir == h1_dir
-                and h1_di_spread > 8
-                and h4_di_spread >= 3
+                and h1_di_spread > 15
+                and h4_di_spread >= 5
+                and h4["adx"] > 10
                 and not ((macro["is_bull"] or macro.get("is_bull_pullback")) and h1_dir == "bearish")
                 and not p3_in_cooldown):
             ranging_breakout = {
@@ -2680,6 +2915,7 @@ def generate_verdict(
             }
             alignment_rule = "规则3a: 4h ranging + 1h/30m breakout 轻仓试单"
             h4["direction"] = h1_dir
+            _dir_override_log.append(f"P3a: {orig_h4_direction} → {h1_dir} (ranging breakout)")
             h4["signal_type"] = "ranging_breakout"
             confidence = 35
             # Stage 1: ranging breakout signal
@@ -2707,9 +2943,7 @@ def generate_verdict(
         # This prevents blindly longing in a ranging downtrend.
         elif (macro["is_bull"] or macro.get("is_bull_pullback")) and not ranging_breakout:
             # Cooldown for macro bias signals (same trend-upgrade override)
-            recent_p3_signals = market_ctx.get("recent_p3_signals", [])
             p3_cooldown_seconds = 10800  # 3h between macro bias signals
-            now_time = time.time()
 
             if upgrading_from_ranging:
                 macro_bias_in_cooldown = False  # trend upgrade overrides cooldown
@@ -2748,6 +2982,7 @@ def generate_verdict(
                         }
                         alignment_rule = "规则3b: 4h ranging + 宏观看涨 bias"
                         h4["direction"] = "bullish"
+                        _dir_override_log.append(f"P3b: {orig_h4_direction} → bullish (macro bias long)")
                         h4["signal_type"] = "macro_bias_long"
                         confidence = 30
                         # Stage 1: macro bias signal
@@ -2779,9 +3014,50 @@ def generate_verdict(
         # Follow 1h direction for entry
         if h1_reg == "trending" and h1["direction"]:
             h4["direction"] = h1["direction"]
+            _dir_override_log.append(f"P3c: {orig_h4_direction} → {h1['direction']} (low_vol_trend 1h confirm)")
             confidence = max(45, h1["confidence"] - 5)
         else:
             confidence = 50
+
+    # Priority 3d: Trend exhaustion reversal — ADX high but declining.
+    # This catches the case where regime is still "trending" (hysteresis
+    # preventing switch to exhaustion) but the trend is clearly ending.
+    # Triggers when: ADX >= 40, ADX declining (fast < slow), price structure
+    # showing reversal, AND smaller TFs confirm opposite direction.
+    elif h4_reg in ("trending", "low_vol_trend") and h4["adx"] >= 40:
+        adx_declining = h4["adx_fast"] < h4["adx_slow"]
+        momentum_weakening = h4.get("momentum") in ("减弱", "衰竭")
+        price_reversal = False
+        h30_ps = h30.get("price_structure", {})
+        if h4["direction"] == "bullish":
+            # Bearish reversal: price making lower highs + lower lows
+            price_reversal = h30_ps.get("type") == "bearish"
+        elif h4["direction"] == "bearish":
+            # Bullish reversal: price making higher lows + higher highs
+            price_reversal = h30_ps.get("type") == "bullish"
+
+        if adx_declining and (momentum_weakening or price_reversal):
+            new_direction = "bullish" if h4["direction"] == "bearish" else "bearish"
+            h30_confirms_reversal = (h30.get("direction") == new_direction)
+            h1_supports_reversal = (h1.get("direction") == new_direction) or h1_reg == "exhaustion"
+
+            if h30_confirms_reversal or h1_supports_reversal:
+                # Block bearish reversal in macro bull
+                if new_direction == "bearish" and (macro.get("is_bull") or macro.get("is_bull_pullback")):
+                    alignment_rule = "规则3d: 趋势衰竭但宏观看涨禁止做空"
+                    confidence = max(30, h4["confidence"] - 20)
+                else:
+                    alignment_rule = "规则3d: 趋势衰竭反转预警（ADX高但正在衰减）"
+                    h4["direction"] = new_direction
+                    h4["regime"] = "exhaustion"  # override for downstream action advice routing
+                    _dir_override_log.append(f"P3d: {orig_h4_direction} → {new_direction} (exhaustion reversal)")
+                    h4["signal_type"] = "exhaustion_reversal"
+                    confidence = max(35, h4["confidence"] - 15)
+                    h4_reg = "exhaustion"  # override for downstream logic
+            else:
+                # ADX declining but no reversal confirmation yet — warn but don't flip
+                alignment_rule = "规则3d: 趋势衰减中，等待反转确认"
+                confidence = max(30, h4["confidence"] - 10)
 
     # Priority 4: 4h exhaustion → reversal signal
     elif h4_reg == "exhaustion":
@@ -2802,7 +3078,8 @@ def generate_verdict(
                 alignment_rule = "规则4: 4h衰竭，但宏观看涨禁止做空"
                 confidence = max(30, h4["confidence"] - 20)
                 h4["direction"] = "bullish"  # Keep original bullish direction
-                h4["signal_type"] = None
+                _dir_override_log.append(f"P4: {orig_h4_direction} → bullish (macro bull blocked)")
+                h4["signal_type"] = "macro_blocked"  # Macro bullish blocked bearish signal
             else:
                 # Cooling check: prevent repeated reversal signals in volatile markets.
                 # Require: (a) at least 1h since last reversal signal of SAME direction, AND
@@ -2830,11 +3107,13 @@ def generate_verdict(
                 elif h30_confirms:
                     alignment_rule = "规则4: 4h exhaustion 反向信号（轻仓试探）"
                     h4["direction"] = new_direction
+                    _dir_override_log.append(f"P4: {orig_h4_direction} → {new_direction} (exhaustion reversal)")
                     h4["signal_type"] = "exhaustion_reversal"
                     confidence = max(35, h4["confidence"] - 15)
                 else:
                     alignment_rule = "规则4: 4h衰竭，30m未确认反转方向"
                     h4["direction"] = new_direction
+                    _dir_override_log.append(f"P4: {orig_h4_direction} → {new_direction} (exhaustion unconfirmed)")
                     h4["signal_type"] = "exhaustion_reversal"
                     confidence = max(30, h4["confidence"] - 15)
 
@@ -2882,6 +3161,18 @@ def generate_verdict(
         reason = exhaustion_reason
         target = None
         stop = None
+    elif h4["regime"] == "trending" and h4["adx"] >= 50:
+        # ADX ≥ 50 = extreme overbought/oversold, trend is exhausted.
+        # Do NOT open new trend-following positions — wait for pullback or reversal.
+        dir_label = "涨" if h4["direction"] == "bullish" else "跌"
+        action = f"趋势过热禁止追单（ADX={h4['adx']:.0f}）"
+        side = "观望"
+        reason = f"ADX={h4['adx']:.0f}处于极端高位，趋势已过度展开，追{dir_label}风险极高，等待回调或反转确认"
+        h4["signal_type"] = "trend_exhaustion_block"
+        # Flag for position manager: existing positions should tighten stops,
+        # block adds, and consider reducing exposure.
+        trend_decay_level = "DECAYING"
+        exhaustion_reason = reason
     elif h4["direction"] == "bullish" and h4["regime"] == "trending":
         if h1["direction"] == "bullish":
             action = "做多"
@@ -2907,11 +3198,6 @@ def generate_verdict(
                 h30_in_low = h30_pct < 40
                 h30_higher_lows = h30_ps.get("higher_lows", False)
 
-                # Pinbar check on last 30m candle
-                h30_pinbar = False
-                if all_candles_4h and len(all_candles_4h) >= 1:
-                    # Use 30m candles from the 30m results
-                    pass  # pinbar check done via price_structure type
                 h30_bullish_type = h30_ps.get("type") == "bullish"
 
                 fib_entry = h30["entry_position"]["range_low"] + (
@@ -3051,6 +3337,7 @@ def generate_verdict(
             action = f"形成态早期信号（轻仓试{direction_label}）"
             side = "多" if h4["direction"] == "bullish" else ("空" if h4["direction"] == "bearish" else "观望")
             reason = f"4h趋势正在形成（{'看涨' if h4['direction'] == 'bullish' else '看跌'}），ADX={h4['adx']:.0f}，1h趋势已确认同向，可轻仓试探"
+            h4["signal_type"] = "trend_forming_early"  # forming signals, not trend_following
         else:
             action = "等待确认"
             side = "观望"  # 形成态不开仓
@@ -3060,9 +3347,16 @@ def generate_verdict(
         side = "观望"
         reason = "市场处于盘整，等待突破"
 
-    # ─── Decay Entry Flag ──────────────────────────────────────────────────
-    # Trend is weakening but still valid (ADX > threshold). Allow entry with reduced risk.
-    _decay_entry = trend_decay_level == "DECAYING" and side != "观望"
+    # ─── Decay Entry Block ──────────────────────────────────────────────────
+    # Trend is weakening — do NOT open new positions in the decaying direction.
+    # Existing positions are handled by the position manager (decay reduction logic).
+    # New entries during decay are logically inconsistent: if the trend is ending,
+    # entering in the same direction bets against our own decay signal.
+    if trend_decay_level == "DECAYING" and side != "观望":
+        direction_label = "涨" if h4["direction"] == "bullish" else "跌"
+        action = f"观望（{direction_label}趋势衰减中）"
+        side = "观望"
+        reason = exhaustion_reason or f"{direction_label}趋势正在衰减，等待方向确认"
 
     # ─── Stage 1 stop/target override ───
     # Stage1 signals use 30m ATR for stop (signal timeframe matches risk).
@@ -3073,7 +3367,19 @@ def generate_verdict(
     # ─── Stage 1 Fallback: when main signal says 观望 but Stage 1 fires ───
     # This makes the two-stage system actionable: even if multi-TF alignment
     # says wait, a Stage 1 warning can trigger a light entry (10-15%).
-    if side == "观望" and trend_decay_level != "EXHAUSTED" and stage_1_warning:
+    # But NOT during DECAYING/EXHAUSTED — trend decay overrides Stage 1.
+    # And NOT in high_volatility/exhaustion — these regimes have too much noise.
+    # And Stage 1 direction must align with macro — no fighting the macro trend.
+    _stage1_regime_ok = h4["regime"] not in ("high_volatility", "exhaustion", "low_volatility")
+    _stage1_dir = stage_1_warning["direction"] if stage_1_warning else None
+    _stage1_macro_ok = True
+    if _stage1_dir:
+        if _stage1_dir == "bearish" and (macro.get("is_bull") or macro.get("is_bull_pullback")):
+            _stage1_macro_ok = False
+        if _stage1_dir == "bullish" and (macro.get("is_bear") or macro.get("is_bear_pullback")):
+            _stage1_macro_ok = False
+
+    if side == "观望" and trend_decay_level == "NONE" and stage_1_warning and _stage1_regime_ok and _stage1_macro_ok:
         s1 = stage_1_warning
         direction_label = "涨" if s1["direction"] == "bullish" else "跌"
         action = f"Stage1预警（轻仓试{direction_label}）"
@@ -3082,8 +3388,9 @@ def generate_verdict(
         # Tag signal type for evolution tracking
         if not h4.get("signal_type"):
             h4["signal_type"] = f"stage1_{s1['type']}"
-        # Stage1 stop/target: 30m ATR for stop (matches signal timeframe)
-        s1_stop_dist = h30["atr"] * 1.5
+        # Stage1 stop: use 30m ATR but floored by 1h ATR — avoids stops
+        # that are too tight for the 4h/1h structure being traded.
+        s1_stop_dist = max(h30["atr"] * 1.5, h1["atr"] * 0.8)
         s1_target_dist = s1_stop_dist * 1.2  # force RR ≥ 1.2
         if side == "多":
             _stage1_stop = round(current_price - s1_stop_dist, 1)
@@ -3099,10 +3406,19 @@ def generate_verdict(
     _aggressive_entry_type = None
     _aggressive_position_pct = None
     _aggressive_entry_note = None
+    _aggressive_leverage = None
 
-    if side == "观望" and trend_decay_level != "EXHAUSTED":
+    # Aggressive strategies: light position, ONLY in ranging/low_volatility regimes.
+    # NOT during DECAYING/EXHAUSTED — trend decay overrides all entries.
+    # Regime whitelist: only allow aggressive signals when market is consolidating
+    # with enough directional energy (ADX > 15). Block in high_volatility,
+    # exhaustion, forming — these regimes have too much noise or false breakouts.
+    _aggressive_regime_ok = h4["regime"] in ("ranging", "low_volatility") and h4["adx"] > 15
+
+    if side == "观望" and trend_decay_level == "NONE" and _aggressive_regime_ok:
         aggressive = _check_aggressive_signals(
             h4, h1, h30, all_candles_4h, all_thresholds, market_ctx, macro,
+            pre_fetched_candles=pre_fetched_klines,
         )
         if aggressive:
             action = aggressive["action"]
@@ -3116,30 +3432,37 @@ def generate_verdict(
             _aggressive_stop = aggressive.get("stop")
             _aggressive_target = aggressive.get("target")
             _aggressive_entry_note = aggressive.get("entry_note", "")
+            _aggressive_leverage = aggressive.get("leverage")
 
     # Funding rate filter (adaptive, not all-or-nothing)
     oi_warning = False
     oi_divergence = False
     funding_rate_pct = funding_rate * 100  # convert to percentage
 
-    if funding_rate > 0.001:  # > 0.1% → block long (extreme)
+    block_thr = settings.funding_rate_block_threshold
+    warn_thr = settings.funding_rate_warn_threshold
+
+    if funding_rate > block_thr:  # > threshold → block long (extreme)
         if side == "多":
             side = "观望"
             action = "观望"
+            h4["direction"] = None
             reason = f"资金费率极高 ({funding_rate_pct:.3f}%)，做多风险过大"
-    elif funding_rate > 0.0005:  # 0.05% ~ 0.1% → elevated funding, note only
+    elif funding_rate > warn_thr:  # warn ~ block → elevated funding, note only
         pass
-    elif funding_rate < -0.001:  # < -0.1% → block short (extreme)
+    elif funding_rate < -block_thr:  # < -threshold → block short (extreme)
         if side == "空":
             side = "观望"
             action = "观望"
+            h4["direction"] = None
             reason = f"资金费率极低 ({funding_rate_pct:.3f}%)，做空风险过大"
-    elif funding_rate < -0.0005:  # -0.1% ~ -0.05% → elevated funding, note only
+    elif funding_rate < -warn_thr:  # -block ~ -warn → elevated funding, note only
         pass
 
     # OI divergence: OI declining + price moving in signal direction
     # Adds price direction check to distinguish normal profit-taking from
     # genuine divergence (OI down + price going against the signal).
+    oi_divergence = False
     if open_interest > 0 and side != "观望":
         prev_oi = market_ctx.get("open_interest_prev", 0)
         if prev_oi > 0:
@@ -3167,6 +3490,10 @@ def generate_verdict(
     # Default stop/target from forecast (overridden below for aggressive signals)
     target_raw = h4["forecast"]["target_conserv"]
     stop_distance = h4["forecast"].get("stop_distance", h4["atr"] * 1.5)
+    # Minimum stop distance floor: 0.15% of price (~$117 at $78k) prevents
+    # zero/tiny stops when ATR collapses during extreme low volatility
+    min_stop_distance = current_price * 0.0015
+    stop_distance = max(stop_distance, min_stop_distance)
     # target_conserv is already direction-aware (below current in downtrend,
     # above in uptrend), so use it directly for both long and short.
     target = target_raw
@@ -3188,6 +3515,15 @@ def generate_verdict(
     if _stage1_target is not None:
         target = _stage1_target
 
+    # Final guard: ensure stop maintains minimum distance from entry price
+    # (catches aggressive/stage1 overrides that could produce stops too close)
+    stop_distance_actual = abs(stop - current_price)
+    if stop_distance_actual < min_stop_distance:
+        if side == "多":
+            stop = round(current_price - min_stop_distance, 1)
+        else:
+            stop = round(current_price + min_stop_distance, 1)
+
     # Entry price: based on timing and direction
 
     # Initialize current_rr for safety check
@@ -3196,18 +3532,40 @@ def generate_verdict(
     # Entry timing: align with trend direction
     entry_pct = h30["entry_position"]["percentile"]
     range_narrow = h30["entry_position"].get("range_too_narrow", False)
+    range_size = h30["entry_position"].get("range_size", 0)
+    # Range too wide (> 2% of price): percentile "high/low" is meaningless
+    # in a wide swing — a 60% position in a $2000 range is still $1200 from top.
+    range_too_wide = range_size > current_price * 0.02
 
     if range_narrow:
         # Range too narrow — percentile unreliable, always use limit at mid-range
         if side == "多":
             timing = "good"
             timing_label = "区间过窄（中位限价）"
-            timing_reason = f"30m区间仅 {h30['entry_position']['range_size']:.0f} 点，百分位不可靠，用区间中位价挂限价单"
+            timing_reason = f"30m区间仅 {range_size:.0f} 点，百分位不可靠，用区间中位价挂限价单"
             entry_action = "limit"
         elif side == "空":
             timing = "good"
             timing_label = "区间过窄（中位限价）"
-            timing_reason = f"30m区间仅 {h30['entry_position']['range_size']:.0f} 点，百分位不可靠，用区间中位价挂限价单"
+            timing_reason = f"30m区间仅 {range_size:.0f} 点，百分位不可靠，用区间中位价挂限价单"
+            entry_action = "limit"
+        else:
+            timing = "good"
+            timing_label = "观望中"
+            timing_reason = "当前无交易信号"
+            entry_action = "wait"
+    elif range_too_wide:
+        # Range too wide — percentile "high/low" labels are meaningless
+        # in a wide swing. Use limit at mid-range to avoid chasing.
+        if side == "多":
+            timing = "good"
+            timing_label = "区间过宽（中位限价）"
+            timing_reason = f"30m区间达 {range_size:.0f} 点（>{current_price*0.02:.0f}），百分位追高/追低不可靠，用区间中位价挂限价单"
+            entry_action = "limit"
+        elif side == "空":
+            timing = "good"
+            timing_label = "区间过宽（中位限价）"
+            timing_reason = f"30m区间达 {range_size:.0f} 点（>{current_price*0.02:.0f}），百分位追高/追低不可靠，用区间中位价挂限价单"
             entry_action = "limit"
         else:
             timing = "good"
@@ -3215,12 +3573,12 @@ def generate_verdict(
             timing_reason = "当前无交易信号"
             entry_action = "wait"
     elif side == "多":
-        if entry_pct > 75:
+        if entry_pct > 60:
             timing = "high"
             timing_label = "接近区间高位"
             timing_reason = f"价格在区间 {entry_pct:.0f}% 位置，追高风险，建议等待回调"
             entry_action = "limit"
-        elif entry_pct < 40:
+        elif entry_pct < 30:
             timing = "low"
             timing_label = "接近区间低位"
             timing_reason = f"价格在区间 {entry_pct:.0f}% 位置，适合现价入场"
@@ -3231,12 +3589,12 @@ def generate_verdict(
             timing_reason = f"价格正在回调中（短期 {h30['entry_position']['short_move_pct']:.2f}%），可等企稳入场"
             entry_action = "limit"
     elif side == "空":
-        if entry_pct < 25:
+        if entry_pct < 40:
             timing = "low"
             timing_label = "接近区间低位"
             timing_reason = f"价格在区间 {entry_pct:.0f}% 位置，追空风险，建议等待反弹"
             entry_action = "limit"
-        elif entry_pct > 60:
+        elif entry_pct > 70:
             timing = "high"
             timing_label = "接近区间高位"
             timing_reason = f"价格在区间 {entry_pct:.0f}% 位置，适合现价做空"
@@ -3261,6 +3619,14 @@ def generate_verdict(
 
     # ─── Position State Machine ───
     pos_state = _analyze_position_state(h4, h1, h30, history_rows or [], position, all_thresholds)
+
+    # Track whether trend is fresh (not yet established across 3 consecutive cycles).
+    # Used by position manager to block re-entry on established trends.
+    _trend_fresh = (
+        _is_fresh_trend(history_rows or [])
+        if h4.get("regime") == "trending"
+        else True
+    )
 
     # 具体下单信号
     atr4 = h4["atr"]
@@ -3308,20 +3674,6 @@ def generate_verdict(
         reward_at_current = abs(target - current_price)
         current_rr = round(reward_at_current / max(risk_at_current, 1), 2)
 
-    # DECAYING entries: tighten stop to 30m ATR when RR is poor (late entry).
-    # When trend is detected after the move has started, 4h stop is too wide
-    # and target is already close → bad RR. Tighter stop improves RR ratio.
-    if _decay_entry and side in ("多", "空") and current_rr is not None and current_rr < 1.0:
-        tight_stop_dist = h30["atr"] * 1.5
-        if side == "多":
-            new_stop = round(current_price - tight_stop_dist, 1)
-            if new_stop > stop:  # long: higher stop = tighter
-                stop = new_stop
-        else:
-            new_stop = round(current_price + tight_stop_dist, 1)
-            if new_stop < stop:  # short: lower stop = tighter
-                stop = new_stop
-
     if side == "多":
         # Price past target: signal opportunity already gone — check FIRST
         _price_past_target_long = target and current_price >= target * 0.999
@@ -3340,8 +3692,7 @@ def generate_verdict(
         rr = round(reward / max(risk, 1), 2)
         # Safety: if current RR < 1.0, market moved too far — force wait
         # But Stage 1 signals are exploratory — switch to market entry instead of blocking.
-        # DECAYING entries use tightened stops (30m ATR) which already account for late entry.
-        if current_rr is not None and current_rr < 1.0 and not stage_1_warning and not _decay_entry:
+        if current_rr is not None and current_rr < 1.0 and not stage_1_warning:
             side = "观望"
             entry_action = "wait"
             entry_note = f"现价盈亏比过低（{current_rr:.2f}），价格已偏离入场位，等待回调至 {entry_price:.0f} 附近再入场（目标 {target:.0f}，止损 {stop:.0f}）"
@@ -3353,7 +3704,9 @@ def generate_verdict(
             order_signal = {
                 "side": "观望",
                 "entry_type": entry_action,
+                "action": pos_state.get("action", ""),
                 "entry_price": entry_price,
+                "planned_entry_price": entry_price,
                 "entry_note": entry_note,
                 "target": target,
                 "stop": stop,
@@ -3372,14 +3725,12 @@ def generate_verdict(
             risk_price_pct = risk / max(entry_price, 1) * 100
             max_safe_pct = 2.0 / max(leverage_num * risk_price_pct / 100, 0.01)
             position_pct = round(min(base_pct, max_safe_pct), 1)
-            # Decay: reduce risk to 1%
-            if _decay_entry:
-                position_pct = 1.0
-                entry_note = f"趋势衰减中，轻仓试探（1%风险）"
             order_signal = {
                 "side": "做多",
                 "entry_type": entry_action,
+                "action": pos_state.get("action", ""),
                 "entry_price": entry_price,
+                "planned_entry_price": entry_price,
                 "entry_note": entry_note,
                 "target": target,
                 "stop": stop,
@@ -3389,7 +3740,7 @@ def generate_verdict(
                 "current_rr": current_rr,
                 "position_pct": position_pct,
                 "leverage": leverage_str,
-                "decay": _decay_entry,
+                "decay": False,
                 "confidence": _order_confidence(rr, confidence),
             }
     elif side == "空":
@@ -3409,8 +3760,7 @@ def generate_verdict(
         rr = round(reward / max(risk, 1), 2)
         # Safety: if current RR < 1.0, market moved too far — force wait
         # But Stage 1 signals are exploratory — switch to market entry instead of blocking.
-        # DECAYING entries use tightened stops (30m ATR) which already account for late entry.
-        if current_rr is not None and current_rr < 1.0 and not stage_1_warning and not _decay_entry:
+        if current_rr is not None and current_rr < 1.0 and not stage_1_warning:
             side = "观望"
             entry_action = "wait"
             entry_note = f"现价盈亏比过低（{current_rr:.2f}），价格已偏离入场位，等待反弹至 {entry_price:.0f} 附近再入场（目标 {target:.0f}，止损 {stop:.0f}）"
@@ -3422,7 +3772,9 @@ def generate_verdict(
             order_signal = {
                 "side": "观望",
                 "entry_type": entry_action,
+                "action": pos_state.get("action", ""),
                 "entry_price": entry_price,
+                "planned_entry_price": entry_price,
                 "entry_note": entry_note,
                 "target": target,
                 "stop": stop,
@@ -3441,13 +3793,12 @@ def generate_verdict(
             risk_price_pct = risk / max(entry_price, 1) * 100
             max_safe_pct = 2.0 / max(leverage_num * risk_price_pct / 100, 0.01)
             position_pct = round(min(base_pct, max_safe_pct), 1)
-            if _decay_entry:
-                position_pct = 1.0
-                entry_note = f"趋势衰减中，轻仓试探（1%风险）"
             order_signal = {
                 "side": "做空",
                 "entry_type": entry_action,
+                "action": pos_state.get("action", ""),
                 "entry_price": entry_price,
+                "planned_entry_price": entry_price,
                 "entry_note": entry_note,
                 "target": target,
                 "stop": stop,
@@ -3457,13 +3808,14 @@ def generate_verdict(
                 "current_rr": current_rr,
                 "position_pct": position_pct,
                 "leverage": leverage_str,
-                "decay": _decay_entry,
+                "decay": False,
                 "confidence": _order_confidence(rr, confidence),
             }
     else:
         order_signal = {
             "side": "观望",
             "entry_price": None,
+            "planned_entry_price": None,
             "entry_note": entry_note,
             "target": None,
             "stop": None,
@@ -3477,20 +3829,15 @@ def generate_verdict(
         }
 
     # ─── Price Past Target: market already moved, signal is stale ───
-    # Check before order_signal construction and after, to catch both
-    # direct side assignments (forming state) and order_signal overrides.
-    _price_past_target = False
-    if side == "空" and target and current_price <= target:
-        _price_past_target = True
-    elif side == "多" and target and current_price >= target:
-        _price_past_target = True
-
+    # Catches cases where order_signal side was set to "做多"/"做空" but
+    # price has already moved past the target (e.g., forming state direct assignment).
     if order_signal.get("side") in ("做多", "做空"):
         _buffer = 0.001  # 0.1% buffer for price noise
         if order_signal["side"] == "做空" and current_price <= target * (1 + _buffer):
             order_signal = {
                 "side": "观望",
                 "entry_price": None,
+                "planned_entry_price": None,
                 "entry_note": f"价格已跌至目标 {target:.0f} 附近，做空机会已错过",
                 "target": None, "stop": None,
                 "risk": None, "reward": None, "rr_ratio": None,
@@ -3503,6 +3850,7 @@ def generate_verdict(
             order_signal = {
                 "side": "观望",
                 "entry_price": None,
+                "planned_entry_price": None,
                 "entry_note": f"价格已涨至目标 {target:.0f} 附近，做多机会已错过",
                 "target": None, "stop": None,
                 "risk": None, "reward": None, "rr_ratio": None,
@@ -3544,6 +3892,13 @@ def generate_verdict(
         order_signal["position_pct"] = _aggressive_position_pct
         if _aggressive_entry_note:
             order_signal["entry_note"] = _aggressive_entry_note
+        if _aggressive_leverage is not None:
+            order_signal["leverage"] = f"{_aggressive_leverage}x"
+
+    # ─── OI Divergence: halve position size ───
+    if oi_divergence and order_signal.get("position_pct"):
+        order_signal["position_pct"] = round(order_signal["position_pct"] * 0.5, 1)
+        order_signal["entry_note"] += "（OI背离，仓位减半）"
 
     summary = f"{'上涨' if h4['direction'] == 'bullish' else '下跌'}趋势（{h4['strength']}），已持续约 {h4['duration_hours']} 小时"
 
@@ -3562,6 +3917,28 @@ def generate_verdict(
     lows_24 = [c["low"] for c in closes_4h[-6:]]
     vol_24h = round(sum(c["volume"] for c in closes_4h[-6:]), 3)
 
+    # Ensure h4 has a proper signal_type — prevent default trend_following leak.
+    # Must run BEFORE the safety loop below, since h4 == results["4h"].
+    if not h4.get("signal_type") or h4["signal_type"] == "none":
+        if h4["regime"] == "ranging" or h4["direction"] is None:
+            h4["signal_type"] = "none"
+        elif h4["regime"] == "forming":
+            h4["signal_type"] = "trend_forming_early"
+        elif h4["regime"] == "trending":
+            h4["signal_type"] = "trend_following"
+        elif h4["regime"] == "low_vol_trend":
+            h4["signal_type"] = "low_vol_trend"
+        elif h4["regime"] == "exhaustion":
+            h4["signal_type"] = "trend_exhaustion"
+        elif h4["regime"] == "high_volatility":
+            h4["signal_type"] = "none"
+        else:
+            h4["signal_type"] = "none"
+
+    # Safety: ensure all timeframes have signal_type (never None or missing)
+    for tf in results:
+        if "signal_type" not in results[tf] or results[tf]["signal_type"] is None:
+            results[tf]["signal_type"] = "none"
 
     return {
         "verdict": {
@@ -3597,14 +3974,14 @@ def generate_verdict(
                 "target": target,
                 "stop": stop,
                 "long_advice": {
-                    "action": "做多" if side == "多" else ("谨慎持有" if side == "观望" else "离场"),
-                    "reason": reason if side == "多" else ("观望等待方向确认" if side == "观望" else "强看涨趋势，多单应离场"),
+                    "action": "做多" if side == "多" else ("谨慎持有" if side == "观望" else "建议减仓或离场"),
+                    "reason": reason if side == "多" else ("观望等待方向确认" if side == "观望" else f"当前信号偏空（{reason}），多单建议减仓或设置 tighter 止损"),
                     "target": target if side == "多" else None,
                     "stop": stop if side == "多" else None,
                 },
                 "short_advice": {
-                    "action": "做空" if side == "空" else ("谨慎持有" if side == "观望" else "离场"),
-                    "reason": reason if side == "空" else ("观望等待方向确认" if side == "观望" else "强看涨趋势，空单应离场"),
+                    "action": "做空" if side == "空" else ("谨慎持有" if side == "观望" else "建议减仓或离场"),
+                    "reason": reason if side == "空" else ("观望等待方向确认" if side == "观望" else f"当前信号偏多（{reason}），空单建议减仓或设置 tighter 止损"),
                     "target": target if side == "空" else None,
                     "stop": stop if side == "空" else None,
                 },
@@ -3647,6 +4024,7 @@ def generate_verdict(
                 "vol_percentile_4h": h4.get("vol_percentile"),
                 "vol_threshold": vol_threshold_info,
                 "alignment_rule": alignment_rule,
+                "trend_fresh": _trend_fresh,
                 "suggested_leverage": f"{int(base_leverage)}x",
                 "convergence_warning": convergence_warning,
                 "ranging_breakout": ranging_breakout,
@@ -3680,6 +4058,8 @@ def generate_verdict(
                     "price_structure": results[tf]["price_structure"],
                     "entry_position": results[tf]["entry_position"],
                     "vol_percentile": results[tf].get("vol_percentile"),
+                    "ema20": results[tf]["ema20"],
+                    "atr_pct": results[tf].get("atr_pct"),
                     "di_spread": results[tf].get("di_spread"),
                     "di_spread_history": results[tf].get("di_spread_history", []),
                     "di_spread_converging": results[tf].get("di_spread_converging", False),

@@ -11,12 +11,16 @@ class Settings:
     password: str = os.getenv("APP_PASSWORD", "trad2026")
     host: str = os.getenv("HOST", "0.0.0.0")
     port: int = int(os.getenv("PORT", "8888"))
-    signal_interval_seconds: int = int(os.getenv("SIGNAL_INTERVAL", "60"))
+    signal_interval_seconds: int = int(os.getenv("SIGNAL_INTERVAL", "5"))
 
     # Hyperliquid
     hyperliquid_enabled: bool = os.getenv("HYPERLIQUID_ENABLED", "false").lower() == "true"
     hyperliquid_testnet: bool = os.getenv("HYPERLIQUID_TESTNET", "true").lower() == "true"
     hyperliquid_private_key: str = os.getenv("HYPERLIQUID_PRIVATE_KEY", "")
+
+    # Funding rate filter thresholds (raw decimal, e.g. 0.001 = 0.1%)
+    funding_rate_block_threshold: float = float(os.getenv("FUNDING_RATE_BLOCK_THRESHOLD", "0.001"))
+    funding_rate_warn_threshold: float = float(os.getenv("FUNDING_RATE_WARN_THRESHOLD", "0.0005"))
 
     # Simulated trading
     sim_initial_balance: float = float(os.getenv("SIM_INITIAL_BALANCE", "10000"))

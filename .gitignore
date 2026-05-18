@@ -1,5 +1,5 @@
 .env
-data/signals.db
+data/
 __pycache__/
 *.pyc
 *.pyo

@@ -1,6 +1,7 @@
 """BTC Signal System — FastAPI main entry point."""
 
 import copy
+import threading
 import time
 from datetime import datetime
 
@@ -17,13 +18,17 @@ from app.signal_engine import generate_verdict
 from app.binance import fetch_klines, fetch_price, fetch_funding_rate, fetch_open_interest, fetch_all_market_data
 from app.evolution import get_evolution_stats, verify_pending_signals, get_active_thresholds
 from app.hyperliquid import place_order as hl_place_order, close_position as hl_close_position
-from app.simulated_position_manager import manage_simulated_position, _check_price_based_exit, _register_auto_hooks
+from app.simulated_position_manager import (
+    manage_simulated_position, _check_price_based_exit,
+    _check_pnl_trailing_stop, _register_auto_hooks,
+)
 
 app = FastAPI()
 templates = Jinja2Templates(directory="app/templates")
 
 # 信号响应缓存，避免每次请求都请求 Binance
 _cache: dict = {"data": None, "ts": 0.0}
+_rebuild_lock = threading.Lock()
 
 
 def _get_cached_signals() -> Optional[dict]:
@@ -38,27 +43,39 @@ def _set_cached_signals(data: dict):
     _cache["ts"] = time.time()
 
 
-def _refresh_live_prices(data: dict):
-    """从 Binance 拉取最新价格和资金费率，更新实时字段。"""
-    try:
-        current_price = fetch_price(settings.binance_symbol)
-        if not current_price:
+def _refresh_live_prices(data: dict, current_price: float = None):
+    """从 Binance 拉取最新价格，更新实时字段。
+
+    Args:
+        data: signal response dict to update
+        current_price: optional pre-fetched price to avoid redundant API call
+    """
+    if current_price is None:
+        try:
+            current_price = fetch_price(settings.binance_symbol)
+        except Exception as e:
+            import logging
+            logging.getLogger("btc_signal").warning(f"fetch_price failed: {e}")
             return
 
+    if not current_price:
+        return
+
+    try:
         # 更新 ticker 价格
         data["ticker"]["price"] = current_price
         data["verdict"]["price_at_signal"] = current_price
 
-        # 更新资金费率（缓存命中时也需要刷新）
-        funding_rate = fetch_funding_rate(settings.binance_symbol)
-        if funding_rate is not None:
-            funding_pct = round(funding_rate * 100, 4)
-            mc = data["verdict"].get("market_context", {})
-            if mc:
-                mc["funding_rate"] = funding_pct
+        # NOTE: funding_rate is NOT updated here — the cached verdict already has
+        # funding_rate as percentage from the last full generate_verdict call.
+        # _refresh_live_prices must NOT overwrite it with raw decimal, since the
+        # signal engine expects raw decimal in market_context but the dashboard
+        # expects percentage in the display. Funding rate has a 5-min cache TTL,
+        # so the display value stays reasonably fresh.
 
         # 更新 OI 及变化率（缓存命中时也需要刷新）
         current_oi, prev_oi = fetch_open_interest(settings.binance_symbol)
+        mc = data["verdict"].get("market_context", {})
         if current_oi and mc:
             mc["open_interest"] = current_oi
             mc["open_interest_prev"] = prev_oi
@@ -68,7 +85,13 @@ def _refresh_live_prices(data: dict):
             data["timeframes"]["30m"]["price"] = current_price
 
         # 更新入场时机的区间和百分位 — 拉最新 20 根 30m K线重新计算区间
-        candles = fetch_klines(settings.binance_symbol, "30m", limit=20)
+        try:
+            candles = fetch_klines(settings.binance_symbol, "30m", limit=20)
+        except Exception as e:
+            import logging
+            logging.getLogger("btc_signal").warning(f"fetch_klines 30m failed: {e}")
+            candles = None
+
         entry = data["verdict"].get("entry_timing", {})
         if entry and candles and len(candles) >= 20:
             highs = [c["high"] for c in candles[-20:]]
@@ -85,26 +108,61 @@ def _refresh_live_prices(data: dict):
                 (current_price - highs[-1]) / max(highs[-1], 1) * 100, 3
             )
 
-        # 更新下单信号的入场价
+        # 更新下单信号的入场价和风险指标
+        # entry_price = 现价（实时），止盈止损 = 固定结构位，盈亏比 = 按计划入场价算
         order = data["verdict"].get("order_signal", {})
         if order and order.get("side") not in (None, "观望"):
-            order["entry_price"] = current_price
             stop = order.get("stop")
             target = order.get("target")
-            if stop is not None and target is not None:
+            # Use planned_entry_price if available (preserves original plan across cache hits)
+            planned_entry = order.get("planned_entry_price") or order.get("entry_price")
+            # Show current BTC price as entry_price
+            order["entry_price"] = current_price
+            if stop is not None and target is not None and planned_entry is not None:
+                # R/R calculated based on planned entry price
                 if order["side"] == "做多":
-                    order["risk"] = round(abs(current_price - stop), 1)
-                    order["reward"] = round(abs(target - current_price), 1)
+                    order["risk"] = round(abs(planned_entry - stop), 1)
+                    order["reward"] = round(abs(target - planned_entry), 1)
                 else:
-                    order["risk"] = round(abs(stop - current_price), 1)
-                    order["reward"] = round(abs(current_price - target), 1)
+                    order["risk"] = round(abs(stop - planned_entry), 1)
+                    order["reward"] = round(abs(planned_entry - target), 1)
                 if order.get("risk", 0) > 0:
                     order["rr_ratio"] = round(order["reward"] / order["risk"], 2)
-                    # Don't override position_pct for decay entries
-                    if not order.get("decay", False):
+                    if not order.get("position_pct"):
                         order["position_pct"] = round(2.0 / max(order["rr_ratio"], 1), 1)
-    except Exception:
-        pass
+
+        # Update advice target/stop based on current price (structural levels stay fixed,
+        # but we recalculate for display consistency)
+        advice = data["verdict"].get("advice", {})
+        if advice.get("side") in ("多", "空"):
+            adv_stop = advice.get("stop")
+            adv_target = advice.get("target")
+            if adv_stop is not None and adv_target is not None:
+                if advice["side"] == "多":
+                    advice["risk"] = round(abs(current_price - adv_stop), 1)
+                    advice["reward"] = round(abs(adv_target - current_price), 1)
+                else:
+                    advice["risk"] = round(abs(adv_stop - current_price), 1)
+                    advice["reward"] = round(abs(current_price - adv_target), 1)
+
+        # Update hold_long/hold_short advice with current price context
+        for key in ("hold_long", "hold_short"):
+            hold = data["verdict"].get(key, {})
+            if hold.get("stop") is not None:
+                hold_stop = hold["stop"]
+                hold_target = hold.get("target")
+                side = key.replace("hold_", "")  # "long" or "short"
+                if side == "long":
+                    hold["risk"] = round(abs(current_price - hold_stop), 1)
+                    if hold_target:
+                        hold["reward"] = round(abs(hold_target - current_price), 1)
+                else:
+                    hold["risk"] = round(abs(hold_stop - current_price), 1)
+                    if hold_target:
+                        hold["reward"] = round(abs(current_price - hold_target), 1)
+    except Exception as e:
+        import logging
+        logging.getLogger("btc_signal").warning(f"_refresh_live_prices update failed: {e}")
 
 
 @app.on_event("startup")
@@ -133,7 +191,11 @@ async def startup():
                 pass  # 监控失败不影响主流程
 
     def _check_sim_position_price_trigger():
-        """从 Binance 拉取实时价格，检查止盈/止损，或尝试自动开仓。"""
+        """从 Binance 拉取实时价格，检查止盈/止损。
+
+        不负责开新仓——开仓由信号周期（API 请求）生成新 verdict 后处理。
+        止损后用旧信号立即开仓是危险行为。
+        """
         current_price = fetch_price(settings.binance_symbol)
         if not current_price:
             return
@@ -145,15 +207,30 @@ async def startup():
             ).fetchone()
 
             if sim_pos_row:
-                # Has open position: check price-based exits
-                _check_price_based_exit(conn, dict(sim_pos_row), current_price)
-            else:
-                # No open position: try auto-open using cached verdict
-                cached = _get_cached_signals()
-                if cached and cached.get("verdict"):
-                    verdict = cached["verdict"]
-                    data = {"verdict": verdict, "ticker": {"price": current_price}}
-                    manage_simulated_position(conn, data, current_price)
+                pos = dict(sim_pos_row)
+                # Check price-based exits (stop-loss / take-profit)
+                if not _check_price_based_exit(conn, pos, current_price):
+                    # Also run PnL trailing stop — this was previously only executed
+                    # during the signal cycle (every 300s), missing profitable windows
+                    _check_pnl_trailing_stop(conn, pos, current_price)
+
+                # Track price extremes for add-on detection (_is_price_extreme)
+                side = pos.get("side")
+                max_p = pos.get("max_price")
+                min_p = pos.get("min_price")
+                price_updates = {}
+                if side == "long" and (max_p is None or current_price > max_p):
+                    price_updates["max_price"] = round(current_price, 1)
+                if side == "short" and (min_p is None or current_price < min_p):
+                    price_updates["min_price"] = round(current_price, 1)
+                if price_updates:
+                    set_clause = ", ".join(f"{k}=?" for k in price_updates)
+                    conn.execute(
+                        f"UPDATE positions SET {set_clause} WHERE id=?",
+                        tuple(price_updates.values()) + (pos["id"],),
+                    )
+                    conn.commit()
+            # No open position: do NOT auto-open here. Wait for next signal cycle.
         finally:
             conn.close()
 
@@ -181,7 +258,7 @@ async def login(request: Request, response: Response):
     if authenticate(username, password):
         token = create_session(username)
         resp = RedirectResponse(url="/", status_code=302)
-        resp.set_cookie("session", token, httponly=True, max_age=86400 * 7)
+        resp.set_cookie("session", token, httponly=True, samesite="strict", max_age=86400 * 7)
         return resp
     return JSONResponse({"detail": "用户名或密码错误"}, status_code=401)
 
@@ -207,18 +284,13 @@ async def websocket_endpoint(ws: WebSocket):
         await ws.close(code=1008)
         return
     import asyncio
-    last_signal_ts = 0.0
     while True:
         try:
             now = time.time()
-            if now - last_signal_ts >= settings.signal_interval_seconds:
-                data = _build_signals_response(force_refresh=True)
-                await ws.send_json(data)
-                last_signal_ts = now
-            else:
-                # Heartbeat to keep connection alive between signal cycles
-                await ws.send_text("ping")
-            await asyncio.sleep(min(30, settings.signal_interval_seconds))
+            # Full verdict refresh every SIGNAL_INTERVAL seconds
+            data = _build_signals_response(force_refresh=True)
+            await ws.send_json(data)
+            await asyncio.sleep(settings.signal_interval_seconds)
         except (WebSocketDisconnect, RuntimeError):
             break
 
@@ -230,105 +302,139 @@ def require_auth(request: Request) -> Optional[str]:
 
 def _build_signals_response(now: float = None, force_refresh: bool = False) -> dict:
     """Build full signals response with verdict + history + snapshots."""
-    # 检查缓存（WebSocket 可强制刷新）
+    # Check cache (WebSocket can force refresh)
     if not force_refresh:
         cached = _get_cached_signals()
         if cached:
-            # 缓存有 verdict，重新查询 DB 获取最新 history/snapshots/evolution
-            conn = get_connection()
-            try:
-                history_rows_raw = conn.execute(
-                    "SELECT * FROM verdict_history ORDER BY created_at DESC LIMIT 50"
-                ).fetchall()
-                history_rows = []
-                for r in history_rows_raw:
-                    history_rows.append({
-                        "regime": r["regime"], "direction": r["direction"],
-                        "strength": r["strength"], "confidence": r["confidence"],
-                        "momentum": r["momentum"], "advice": r["advice"],
-                        "price": r["price"], "adx_4h": r["adx_4h"], "adx_1h": r["adx_1h"],
-                        "dir_4h": r["dir_4h"], "dir_1h": r["dir_1h"],
-                        "created_at": r["created_at"],
-                    })
+            return _build_cache_path_response(cached)
 
-                verdict_history = []
-                for r in history_rows:
-                    dt = datetime.fromtimestamp(r.get("created_at", time.time())).strftime("%m-%d %H:%M")
-                    verdict_history.append({**r, "time": dt})
-                # 连续相同去重
-                deduped = []
-                for h in verdict_history:
-                    if not deduped or deduped[-1]["regime"] != h["regime"] or deduped[-1]["direction"] != h["direction"]:
-                        deduped.append(h)
-                verdict_history = deduped
+    # Cache miss or forced refresh: rebuild with lock to prevent concurrent rebuilds
+    with _rebuild_lock:
+        # Double-check after acquiring lock
+        if not force_refresh:
+            cached = _get_cached_signals()
+            if cached:
+                return _build_cache_path_response(cached)
+        return _rebuild_signals_response(now)
 
-                snapshots = conn.execute(
-                    "SELECT regime, direction, adx, plus_di, minus_di, price_at_signal, created_at "
-                    "FROM signals WHERE timeframe = '30m' ORDER BY created_at DESC LIMIT 10"
-                ).fetchall()
-                m30_snapshots = []
-                for s in snapshots:
-                    dt = datetime.fromtimestamp(s["created_at"]).strftime("%H:%M:%S")
-                    m30_snapshots.append({
-                        "ts": s["created_at"], "time": dt,
-                        "price": s["price_at_signal"], "adx": s["adx"],
-                        "plus_di": s["plus_di"], "minus_di": s["minus_di"],
-                        "regime": s["regime"], "direction": s["direction"],
-                    })
 
-                # Get open position for state machine (manual only)
-                open_position = conn.execute(
-                    "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 0 ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()
-                position_dict = dict(open_position) if open_position else None
-
-                # Deep-copy cached data and manage positions while connection is open
-                data = copy.deepcopy(cached["data"])
-                manage_simulated_position(conn, data, data["ticker"]["price"])
-
-                # Re-query simulated position since management may have changed it
-                sim_row = conn.execute(
-                    "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 1 ORDER BY created_at DESC LIMIT 1"
-                ).fetchone()
-
-                # Evolution uses same conn (avoids extra DB open/close)
-                evolution_data = _build_evolution(conn)
-
-                data["verdict_history"] = verdict_history
-                data["m30_snapshots"] = m30_snapshots
-                data["timestamp"] = datetime.now().isoformat()
-                data["evolution"] = evolution_data
-                data["simulated_position"] = dict(sim_row) if sim_row else None
-
-                # Reload per-TF base thresholds after evolution may have adjusted them
-                ev_params = get_active_thresholds()
-                tf_cfg = ev_params.get("tf_thresholds", {})
-                vol_adj_factor = ev_params.get("vol_adjustment_factor", 0.1)
-                for tf_key in ["30m", "1h", "4h"]:
-                    tf_base = tf_cfg.get(tf_key, {})
-                    base_t = tf_base.get("adx_trending_threshold", ev_params["adx_trending_threshold"])
-                    base_f = tf_base.get("adx_forming_threshold", ev_params["adx_forming_threshold"])
-                    tf_data = data.get("verdict", {}).get("timeframes", {}).get(tf_key, {})
-                    vol_pct = tf_data.get("vol_percentile", 50)
-                    t_adj = max(-5, min(5, (vol_pct - 50) * vol_adj_factor))
-                    f_adj = max(-3, min(3, (vol_pct - 50) * vol_adj_factor * 0.6))
-                    tf_data["base_trending"] = base_t
-                    tf_data["base_forming"] = base_f
-                    tf_data["trending_adj"] = round(t_adj, 1)
-                    tf_data["forming_adj"] = round(f_adj, 1)
-                    tf_data["effective_trending"] = round(min(base_t + t_adj, 34), 1)
-                    tf_data["effective_forming"] = round(min(base_f + f_adj, 28), 1)
-
-                # 更新实时价格
-                _refresh_live_prices(data)
-            finally:
-                conn.close()
-            return data
-
-    # 缓存过期或强制刷新，调用 Binance
+def _build_cache_path_response(cached: dict) -> dict:
+    """Cache hit path: deep-copy verdict and refresh live price."""
     conn = get_connection()
     try:
+        history_rows_raw = conn.execute(
+            "SELECT * FROM verdict_history ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+        history_rows = []
+        for r in history_rows_raw:
+            history_rows.append({
+                "regime": r["regime"], "direction": r["direction"],
+                "strength": r["strength"], "confidence": r["confidence"],
+                "momentum": r["momentum"], "advice": r["advice"],
+                "price": r["price"], "adx_4h": r["adx_4h"], "adx_1h": r["adx_1h"],
+                "dir_4h": r["dir_4h"], "dir_1h": r["dir_1h"],
+                "created_at": r["created_at"],
+            })
 
+        verdict_history = []
+        for r in history_rows:
+            dt = datetime.fromtimestamp(r.get("created_at", time.time())).strftime("%m-%d %H:%M")
+            verdict_history.append({**r, "time": dt})
+        # 连续相同去重
+        deduped = []
+        for h in verdict_history:
+            if not deduped or deduped[-1]["regime"] != h["regime"] or deduped[-1]["direction"] != h["direction"]:
+                deduped.append(h)
+        verdict_history = deduped
+
+        snapshots = conn.execute(
+            "SELECT regime, direction, adx, plus_di, minus_di, price_at_signal, created_at "
+            "FROM signals WHERE timeframe = '30m' ORDER BY created_at DESC LIMIT 10"
+        ).fetchall()
+        m30_snapshots = []
+        for s in snapshots:
+            dt = datetime.fromtimestamp(s["created_at"]).strftime("%H:%M:%S")
+            m30_snapshots.append({
+                "ts": s["created_at"], "time": dt,
+                "price": s["price_at_signal"], "adx": s["adx"],
+                "plus_di": s["plus_di"], "minus_di": s["minus_di"],
+                "regime": s["regime"], "direction": s["direction"],
+            })
+
+        # Get open position for state machine (manual only)
+        open_position = conn.execute(
+            "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 0 ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        position_dict = dict(open_position) if open_position else None
+
+        # Deep-copy cached data, refresh price BEFORE position management
+        data = copy.deepcopy(cached["data"])
+
+        # Fetch live price first — manage_simulated_position needs current
+        # price for accurate stop-loss/take-profit checks
+        try:
+            live_price = fetch_price(settings.binance_symbol)
+            if live_price:
+                data["ticker"]["price"] = live_price
+        except Exception:
+            pass  # fall back to cached price
+
+        # Now manage positions with the freshest price available
+        manage_simulated_position(conn, data, data["ticker"]["price"])
+
+        # Save planned entry price before _refresh_live_prices overwrites it
+        _planned_entry = data["verdict"].get("order_signal", {}).get("entry_price")
+        if _planned_entry is not None:
+            data["verdict"]["order_signal"]["planned_entry_price"] = _planned_entry
+
+        # Re-query simulated position since management may have changed it
+        sim_row = conn.execute(
+            "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 1 ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+
+        # Evolution uses same conn (avoids extra DB open/close)
+        evolution_data = _build_evolution(conn)
+
+        data["verdict_history"] = verdict_history
+        data["m30_snapshots"] = m30_snapshots
+        data["timestamp"] = datetime.now().isoformat()
+        data["evolution"] = evolution_data
+        data["simulated_position"] = dict(sim_row) if sim_row else None
+
+        # Reload per-TF base thresholds after evolution may have adjusted them
+        ev_params = get_active_thresholds()
+        tf_cfg = ev_params.get("tf_thresholds", {})
+        vol_adj_factor = ev_params.get("vol_adjustment_factor", 0.1)
+        for tf_key in ["30m", "1h", "4h"]:
+            tf_base = tf_cfg.get(tf_key, {})
+            base_t = tf_base.get("adx_trending_threshold", ev_params["adx_trending_threshold"])
+            base_f = tf_base.get("adx_forming_threshold", ev_params["adx_forming_threshold"])
+            tf_data = data.get("verdict", {}).get("timeframes", {}).get(tf_key, {})
+            vol_pct = tf_data.get("vol_percentile", 50)
+            t_adj = max(-5, min(5, (vol_pct - 50) * vol_adj_factor))
+            f_adj = max(-3, min(3, (vol_pct - 50) * vol_adj_factor * 0.6))
+            tf_data["base_trending"] = base_t
+            tf_data["base_forming"] = base_f
+            tf_data["trending_adj"] = round(t_adj, 1)
+            tf_data["forming_adj"] = round(f_adj, 1)
+            tf_data["effective_trending"] = round(min(base_t + t_adj, 34), 1)
+            tf_data["effective_forming"] = round(min(base_f + f_adj, 28), 1)
+
+        # 更新实时价格（复用已获取的 live_price，避免重复调用 fetch_price）
+        _refresh_live_prices(data, data.get("ticker", {}).get("price"))
+        data["_generated_at"] = time.time()
+    finally:
+        conn.close()
+    return data
+
+
+def _rebuild_signals_response(now: float = None) -> dict:
+    """Cache miss: full signal generation from Binance."""
+    import logging
+    logger = logging.getLogger('btc_signal')
+
+    conn = get_connection()
+    try:
         # Query history rows and open position BEFORE generating verdict
         history_rows_raw = conn.execute(
             "SELECT * FROM verdict_history ORDER BY created_at DESC LIMIT 300"
@@ -362,7 +468,12 @@ def _build_signals_response(now: float = None, force_refresh: bool = False) -> d
         funding_rate = market_data.get("funding_rate", 0.0)
         current_oi = market_data.get("open_interest", 0.0)
         prev_oi = market_data.get("open_interest_prev", 0.0)
-    
+
+        # Fetch failure guard: 4h klines are mandatory for signal generation
+        if not market_data.get("klines_4h"):
+            logger.error("4h K线获取失败，信号生成中止")
+            raise RuntimeError("4h K线获取失败，信号生成中止")
+
         # Recent price history for OI divergence detection
         price_candles = market_data.get("klines_4h", [])[:6]
         price_history = [c["close"] for c in price_candles] if price_candles else []
@@ -430,7 +541,19 @@ def _build_signals_response(now: float = None, force_refresh: bool = False) -> d
             "aggressive_cooldowns": aggressive_cooldowns,
             "last_aggressive_signal": last_aggressive,
         }
-    
+
+        # Query previous per-TF regimes for hysteresis
+        previous_regimes = {}
+        for tf in ("30m", "1h", "4h"):
+            row = conn.execute(
+                "SELECT regime, direction FROM signals WHERE timeframe = ? ORDER BY created_at DESC LIMIT 1",
+                (tf,),
+            ).fetchone()
+            if row:
+                previous_regimes[tf] = row["regime"]
+                if row["direction"]:
+                    previous_regimes[f"{tf}_direction"] = row["direction"]
+
         data = generate_verdict(
             history_rows=history_rows,
             position=position_dict,
@@ -440,6 +563,7 @@ def _build_signals_response(now: float = None, force_refresh: bool = False) -> d
                 "1h": market_data.get("klines_1h", []),
                 "4h": market_data.get("klines_4h", []),
             },
+            previous_regimes=previous_regimes,
         )
         latest_signals = {}
         for tf in data["timeframes"]:
@@ -488,22 +612,39 @@ def _build_signals_response(now: float = None, force_refresh: bool = False) -> d
                 )
     
         if signal_changed:
-            conn.execute(
-                "INSERT INTO verdict_history (regime, direction, strength, confidence, "
-                "momentum, advice, price, adx_4h, adx_1h, dir_4h, dir_1h, created_at) VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    data["verdict"]["regime"], data["verdict"]["direction"],
-                    data["verdict"]["strength"], data["verdict"]["confidence"],
-                    data["verdict"]["momentum"], data["verdict"]["advice"]["action"],
-                    data["ticker"]["price"],
-                    data["timeframes"]["4h"]["adx"],
-                    data["timeframes"]["1h"]["adx"],
-                    data["timeframes"]["4h"]["direction"],
-                    data["timeframes"]["1h"]["direction"],
-                    now,
-                ),
-            )
+            # Dedup verdict_history: only insert when verdict actually changed,
+            # AND at least 30 minutes since last entry (prevents regime flip-flop).
+            last_verdict = conn.execute(
+                "SELECT regime, direction, strength, created_at FROM verdict_history ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            verdict_key = (data["verdict"]["regime"], data["verdict"]["direction"], data["verdict"]["strength"])
+            min_interval = 1800  # 30 minutes between verdict entries
+            if last_verdict is None:
+                should_insert = True
+            elif (last_verdict["regime"], last_verdict["direction"], last_verdict["strength"]) == verdict_key:
+                should_insert = False  # exact same verdict
+            elif (now - last_verdict["created_at"]) < min_interval:
+                should_insert = False  # too soon, skip
+            else:
+                should_insert = True
+
+            if should_insert:
+                conn.execute(
+                    "INSERT INTO verdict_history (regime, direction, strength, confidence, "
+                    "momentum, advice, price, adx_4h, adx_1h, dir_4h, dir_1h, created_at) VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        data["verdict"]["regime"], data["verdict"]["direction"],
+                        data["verdict"]["strength"], data["verdict"]["confidence"],
+                        data["verdict"]["momentum"], data["verdict"]["advice"]["action"],
+                        data["ticker"]["price"],
+                        data["timeframes"]["4h"]["adx"],
+                        data["timeframes"]["1h"]["adx"],
+                        data["timeframes"]["4h"]["direction"],
+                        data["timeframes"]["1h"]["direction"],
+                        now,
+                    ),
+                )
         conn.commit()
     
         history_rows = conn.execute(
@@ -547,17 +688,35 @@ def _build_signals_response(now: float = None, force_refresh: bool = False) -> d
     
         # Manage simulated positions
         manage_simulated_position(conn, data, data["ticker"]["price"])
-    
+
+        # Save planned entry price BEFORE _refresh_live_prices overwrites entry_price
+        _planned_entry = data["verdict"].get("order_signal", {}).get("entry_price")
+        if _planned_entry is not None:
+            data["verdict"]["order_signal"]["planned_entry_price"] = _planned_entry
+
         # 同步实时价格，确保 ticker.price 和 timeframes['30m'].price 一致
-        _refresh_live_prices(data)
+        _refresh_live_prices(data, data.get("ticker", {}).get("price"))
     
         # Query simulated position for response
         sim_row = conn.execute(
             "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 1 ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
-        data["simulated_position"] = dict(sim_row) if sim_row else None
+        if sim_row:
+            sim = dict(sim_row)
+            # Attach original position size from action_state (for reduced positions)
+            orig = conn.execute(
+                "SELECT position_size FROM position_action_state "
+                "WHERE position_id = ? AND action = 'open' LIMIT 1",
+                (sim["id"],),
+            ).fetchone()
+            if orig and orig["position_size"]:
+                sim["original_size"] = orig["position_size"]
+            data["simulated_position"] = sim
+        else:
+            data["simulated_position"] = None
 
         # 写入缓存
+        data["_generated_at"] = time.time()
         _set_cached_signals({"data": data})
     finally:
         conn.close()
@@ -576,7 +735,7 @@ def _build_evolution(conn=None) -> dict:
         "SELECT COUNT(*) as cnt FROM signals WHERE verified = 0"
     ).fetchone()
     if pending and pending["cnt"] > 0:
-        verify_pending_signals()
+        verify_pending_signals(conn)
 
     result = get_evolution_stats()
 
@@ -699,8 +858,19 @@ async def api_get_simulated_position(request: Request):
     row = conn.execute(
         "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 1 ORDER BY created_at DESC LIMIT 1"
     ).fetchone()
+    if row:
+        sim = dict(row)
+        orig = conn.execute(
+            "SELECT position_size FROM position_action_state "
+            "WHERE position_id = ? AND action = 'open' LIMIT 1",
+            (sim["id"],),
+        ).fetchone()
+        if orig and orig["position_size"]:
+            sim["original_size"] = orig["position_size"]
+    else:
+        sim = None
     conn.close()
-    return dict(row) if row else None
+    return sim
 
 
 @app.get("/api/positions/simulated/history")
@@ -770,8 +940,11 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
         close_rec["created_at"] = close_rec["closed_at"]  # show close time in UI
         all_records.append(close_rec)
 
-    # Sort by: open positions first (status=open), then closed by created_at desc
-    # Already ordered by SQL, just keep the order: open first, then closed pairs
+    # Sort ALL records by display time descending
+    for rec in all_records:
+        rec["_sort_time"] = rec.get("created_at") or rec.get("closed_at") or 0
+    all_records.sort(key=lambda r: r["_sort_time"], reverse=True)
+
     # Apply pagination
     total_pages = (total + page_size - 1) // page_size if page_size > 0 else 0
     records = all_records[offset:offset + page_size]
@@ -811,7 +984,9 @@ async def api_simulated_position_stats(request: Request):
     # Today's PnL: closed positions since start of today (UTC+8)
     import time as _time
     now = _time.time()
-    today_start = now - (now % 86400) - 8 * 3600  # approximate today midnight UTC+8
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    utc8_now = _dt.now(_tz.utc).astimezone(_tz(_td(hours=8)))
+    today_start = _dt(utc8_now.year, utc8_now.month, utc8_now.day).replace(tzinfo=_tz(_td(hours=8))).timestamp()
     row = conn.execute(
         "SELECT COALESCE(SUM(pnl), 0) as today_pnl, COUNT(*) as today_trades "
         "FROM positions WHERE is_simulated = 1 AND status = 'closed' AND closed_at >= ?",
@@ -836,6 +1011,47 @@ async def api_simulated_position_stats(request: Request):
         margin = 0
         available_balance = current_balance
 
+    # Win rate
+    row = conn.execute(
+        "SELECT COUNT(*) as wins FROM positions WHERE is_simulated = 1 AND status = 'closed' AND pnl > 0"
+    ).fetchone()
+    wins = row["wins"]
+    win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0
+
+    # 7-day equity curve: daily balance snapshot
+    seven_days_ago = now - 7 * 86400
+    # Build timeline: start from initial balance, add closed pnl day by day
+    rows = conn.execute(
+        "SELECT date(closed_at, 'unixepoch', '+8 hours') as day, COALESCE(SUM(pnl), 0) as day_pnl "
+        "FROM positions WHERE is_simulated = 1 AND status = 'closed' AND closed_at >= ? "
+        "GROUP BY day ORDER BY day",
+        (seven_days_ago,),
+    ).fetchall()
+
+    # Include realized pnl from currently open positions (from reduces)
+    open_realized = conn.execute(
+        "SELECT COALESCE(SUM(realized_pnl), 0) as rpnl FROM positions "
+        "WHERE is_simulated = 1 AND status = 'open'"
+    ).fetchone()["rpnl"] or 0
+
+    equity_curve = []
+    cum_pnl = 0
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    # Merge open realized pnl into today's pnl to avoid duplicate date entries
+    if open_realized != 0:
+        # Check if today already has closed pnl entries
+        if rows and rows[-1]["day"] == today_str:
+            # Merge: add open realized to today's pnl
+            rows[-1] = {"day": today_str, "day_pnl": rows[-1]["day_pnl"] + open_realized}
+        else:
+            # No closed entries today, add a new row
+            rows = list(rows) + [{"day": today_str, "day_pnl": open_realized}]
+
+    for r in rows:
+        cum_pnl += r["day_pnl"]
+        equity_curve.append({"date": r["day"], "balance": round(initial_balance + cum_pnl, 2)})
+
     conn.close()
 
     return {
@@ -847,6 +1063,10 @@ async def api_simulated_position_stats(request: Request):
         "today_trades": today_trades,
         "available_balance": round(available_balance, 2),
         "margin_used": round(margin, 2),
+        "win_rate": win_rate,
+        "wins": wins,
+        "losses": total_trades - wins,
+        "equity_curve": equity_curve,
     }
 
 

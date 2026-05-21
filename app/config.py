@@ -17,6 +17,10 @@ class Settings:
     hyperliquid_enabled: bool = os.getenv("HYPERLIQUID_ENABLED", "false").lower() == "true"
     hyperliquid_testnet: bool = os.getenv("HYPERLIQUID_TESTNET", "true").lower() == "true"
     hyperliquid_private_key: str = os.getenv("HYPERLIQUID_PRIVATE_KEY", "")
+    hyperliquid_account_address: str = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS", "")
+
+    # Trade backend (simulated / hyperliquid)
+    trade_backend: str = os.getenv("TRADE_BACKEND", "simulated")
 
     # Funding rate filter thresholds (raw decimal, e.g. 0.001 = 0.1%)
     funding_rate_block_threshold: float = float(os.getenv("FUNDING_RATE_BLOCK_THRESHOLD", "0.001"))

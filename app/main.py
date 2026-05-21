@@ -1,6 +1,7 @@
 """BTC Signal System — FastAPI main entry point."""
 
 import copy
+import logging
 import threading
 import time
 from datetime import datetime
@@ -17,11 +18,14 @@ from app.auth import create_session, verify_session, authenticate
 from app.signal_engine import generate_verdict
 from app.binance import fetch_klines, fetch_price, fetch_funding_rate, fetch_open_interest, fetch_all_market_data
 from app.evolution import get_evolution_stats, verify_pending_signals, get_active_thresholds
-from app.hyperliquid import place_order as hl_place_order, close_position as hl_close_position
+from app.trade_executor import get_router
+from app.hyperliquid_viewer import get_viewer
 from app.simulated_position_manager import (
     manage_simulated_position, _check_price_based_exit,
     _check_pnl_trailing_stop, _register_auto_hooks,
 )
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 templates = Jinja2Templates(directory="app/templates")
@@ -54,8 +58,7 @@ def _refresh_live_prices(data: dict, current_price: float = None):
         try:
             current_price = fetch_price(settings.binance_symbol)
         except Exception as e:
-            import logging
-            logging.getLogger("btc_signal").warning(f"fetch_price failed: {e}")
+            logger.warning(f"fetch_price failed: {e}")
             return
 
     if not current_price:
@@ -88,8 +91,7 @@ def _refresh_live_prices(data: dict, current_price: float = None):
         try:
             candles = fetch_klines(settings.binance_symbol, "30m", limit=20)
         except Exception as e:
-            import logging
-            logging.getLogger("btc_signal").warning(f"fetch_klines 30m failed: {e}")
+            logger.warning(f"fetch_klines 30m failed: {e}")
             candles = None
 
         entry = data["verdict"].get("entry_timing", {})
@@ -161,13 +163,15 @@ def _refresh_live_prices(data: dict, current_price: float = None):
                     if hold_target:
                         hold["reward"] = round(abs(current_price - hold_target), 1)
     except Exception as e:
-        import logging
-        logging.getLogger("btc_signal").warning(f"_refresh_live_prices update failed: {e}")
+        logger.warning(f"_refresh_live_prices update failed: {e}")
 
 
 @app.on_event("startup")
 async def startup():
     init_db()
+    # 从 SQLite 加载历史 K 线到内存缓存，实现增量续接
+    from app.binance import load_klines_from_db
+    load_klines_from_db(settings.binance_symbol)
     # 后台预热缓存，避免首次访问慢
     import threading
     def _warm_cache():
@@ -180,6 +184,11 @@ async def startup():
     # Register auto-trader callbacks (mirrors simulated positions to Hyperliquid)
     from app.auto_trader import register_callbacks
     register_callbacks()
+
+    # Startup sync: reconcile Hyperliquid position state with DB.
+    # Runs once at boot to catch drift from crashes, passive fills, etc.
+    from app.auto_trader import _hl_startup_sync
+    _hl_startup_sync()
 
     # 后台监控模拟仓位，独立于信号缓存（每 10 秒检查一次止盈/止损）
     def _monitor_sim_positions():
@@ -196,7 +205,16 @@ async def startup():
         不负责开新仓——开仓由信号周期（API 请求）生成新 verdict 后处理。
         止损后用旧信号立即开仓是危险行为。
         """
-        current_price = fetch_price(settings.binance_symbol)
+        current_price = None
+        try:
+            current_price = fetch_price(settings.binance_symbol)
+        except Exception:
+            pass
+        if not current_price:
+            try:
+                current_price = fetch_price(settings.binance_symbol)
+            except Exception:
+                return  # 两次获取失败，跳过本次检查
         if not current_price:
             return
 
@@ -209,12 +227,22 @@ async def startup():
             if sim_pos_row:
                 pos = dict(sim_pos_row)
                 # Check price-based exits (stop-loss / take-profit)
-                if not _check_price_based_exit(conn, pos, current_price):
+                exited = _check_price_based_exit(conn, pos, current_price)
+                if not exited:
                     # Also run PnL trailing stop — this was previously only executed
                     # during the signal cycle (every 300s), missing profitable windows
                     _check_pnl_trailing_stop(conn, pos, current_price)
+                    # Re-check status since trailing stop may have closed it
+                    if pos.get("status") != "open":
+                        conn.close()
+                        return
 
                 # Track price extremes for add-on detection (_is_price_extreme)
+                # Only if position is still open (exits above may have closed it)
+                if pos.get("status") != "open":
+                    conn.close()
+                    return
+
                 side = pos.get("side")
                 max_p = pos.get("max_price")
                 min_p = pos.get("min_price")
@@ -235,6 +263,484 @@ async def startup():
             conn.close()
 
     threading.Thread(target=_monitor_sim_positions, daemon=True).start()
+
+    # 后台 K 线同步任务 —— 每 15 秒从 Binance 拉取各周期 K 线写入数据库，
+    # 保证信号验证等场景有最新数据可用，不依赖实时网络请求。
+    def _sync_klines_to_db():
+        while True:
+            try:
+                time.sleep(30)
+                for tf in ("30m", "1h", "4h"):
+                    fetch_klines(settings.binance_symbol, tf, limit=200)
+            except Exception:
+                pass  # 同步失败不影响主流程，下次周期自动重试
+
+    threading.Thread(target=_sync_klines_to_db, daemon=True).start()
+
+    def _sync_hl_position():
+        """Reconcile Hyperliquid exchange position state with local DB.
+
+        Detects passive TP/SL fills (HL executes the limit/stop order
+        independently) or manual closes on the HL platform. When the HL
+        exchange shows no position but local DB has an open HL position,
+        we query fills to find the closing trade, extract the actual fill
+        price and closedPnl, and update the local DB accordingly.
+        """
+        if not settings.auto_trade_enabled:
+            return
+
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM positions WHERE status='open' AND hl_enabled=1 "
+                "ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return  # no open HL position to sync
+
+            pos = dict(row)
+
+            # Check actual HL position state
+            try:
+                hl_pos = get_router().get_position_state()
+            except Exception:
+                return  # HL query failed, try next cycle
+
+            if hl_pos:
+                # HL still has a position — check if size matches
+                local_size = pos.get("position_size") or 0
+                hl_size = hl_pos.get("size") or 0
+                # Allow small float deviation (rounding differences)
+                if abs(local_size - hl_size) > 0.0001:
+                    # Size mismatch: HL was partially closed outside our flow,
+                    # or an add/reduce failed to execute on HL.
+                    # Update hl_sz and resize TP/SL to match exchange reality
+                    logger.info(
+                        "[HL sync] size mismatch: local=%s hl=%s → updating hl_sz + TP/SL",
+                        local_size, hl_size,
+                    )
+                    conn.execute(
+                        "UPDATE positions SET hl_sz=? WHERE id=? AND hl_enabled=1",
+                        (round(hl_size, 6), pos["id"]),
+                    )
+                    conn.commit()
+
+                    # Resize TP/SL orders to match actual HL size
+                    side = pos.get("side", "")
+                    tp_price = pos.get("target")
+                    sl_price = pos.get("stop")
+                    tp_oid = pos.get("hl_tp_oid")
+                    sl_oid = pos.get("hl_sl_oid")
+                    actual_sz = round(hl_size, 6)
+
+                    if actual_sz > 0 and side:
+                        router = get_router()
+
+                        if tp_oid and tp_oid != "None" and tp_price:
+                            tp_result = router.set_take_profit(str(tp_oid), tp_price, actual_sz, side)
+                            if tp_result.get("ok"):
+                                logger.info("[HL sync] TP resized: size=%s", actual_sz)
+
+                        if sl_oid and sl_oid != "None" and sl_price:
+                            sl_result = router.set_stop_loss(str(sl_oid), sl_price, actual_sz, side)
+                            if sl_result.get("ok"):
+                                logger.info("[HL sync] SL resized: size=%s", actual_sz)
+
+                return
+
+            # HL shows no position but local DB says open → passive close detected
+            # Query fills to find the closing trade
+            viewer = get_viewer()
+            fills_data = viewer.get_fills(page=1, size=10)
+            fills = fills_data.get("fills", [])
+            if not fills:
+                logger.warning("[HL sync] passive close detected but no fills found")
+                return
+
+            # Find the fill that closed the position. A close fill has:
+            # - side opposite to position direction (close = sell for long, buy for short)
+            # - dir contains "close" (Hyperliquid marks close fills)
+            side = pos.get("side", "")
+            close_side = "short" if side == "long" else "long"  # opposite of position side
+
+            closing_fill = None
+            for f in fills:
+                fill_side = f.get("side", "")
+                fill_dir = f.get("dir", "")
+                # HL uses "sell" for closing long, "buy" for closing short
+                # and dir may contain "close" info
+                if fill_side == close_side:
+                    closing_fill = f
+                    break
+
+            if not closing_fill:
+                logger.warning("[HL sync] no matching closing fill found")
+                return
+
+            actual_price = closing_fill.get("price") or 0
+            closed_pnl = closing_fill.get("closed_pnl") or 0
+
+            if actual_price <= 0:
+                logger.warning("[HL sync] closing fill has invalid price=%s", actual_price)
+                return
+
+            # Determine close reason from context
+            # If price hit stop → stop_loss, if price hit target → take_profit
+            stop = pos.get("stop")
+            target = pos.get("target")
+            close_reason = "hl_passive_close"
+            if stop is not None:
+                if side == "long" and actual_price <= stop * 1.005:  # 0.5% tolerance
+                    close_reason = "stop_loss"
+                elif side == "short" and actual_price >= stop * 0.995:
+                    close_reason = "stop_loss"
+            if target is not None:
+                if side == "long" and actual_price >= target * 0.995:
+                    close_reason = "take_profit"
+                elif side == "short" and actual_price <= target * 1.005:
+                    close_reason = "take_profit"
+
+            # Use HL-reported closedPnl if available, otherwise compute from price
+            pnl_to_record = closed_pnl
+            if pnl_to_record == 0:
+                entry = pos.get("entry_price") or 0
+                btc_qty = pos.get("position_size") or 0
+                if entry > 0 and btc_qty > 0:
+                    if side == "long":
+                        pnl_to_record = btc_qty * (actual_price - entry)
+                    else:
+                        pnl_to_record = btc_qty * (entry - actual_price)
+
+            now = time.time()
+            conn.execute(
+                "UPDATE positions SET status='closed', pnl=?, close_reason=?, "
+                "close_price=?, closed_at=?, updated_at=? WHERE id=? AND status='open'",
+                (round(pnl_to_record, 2), close_reason, round(actual_price, 1), now, now, pos["id"]),
+            )
+            if conn.execute("SELECT changes()").fetchone()[0] == 0:
+                return  # already closed by another path
+            conn.commit()
+
+            logger.info(
+                "[HL sync] passive close reconciled: side=%s price=%s pnl=%.2f reason=%s",
+                side, actual_price, pnl_to_record, close_reason,
+            )
+        finally:
+            conn.close()
+
+    # Background HL position sync: detect passive TP/SL fills or manual HL closes
+    # and reconcile local DB with exchange state.
+    if settings.auto_trade_enabled:
+        def _hl_position_sync():
+            while True:
+                try:
+                    time.sleep(15)
+                    _sync_hl_position()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_hl_position_sync, daemon=True).start()
+
+        # Background HL position reconciliation: detect simulated positions
+        # that haven't been mirrored to HL yet (hl_enabled=0) and open them.
+        def _hl_position_reconcile():
+            """Reconcile HL simulated positions every 30s.
+
+            Detects positions where the local simulated DB was created but
+            the HL mirror failed to open (hl_enabled=0). This can happen
+            if _hl_mirror_open crashed after the INSERT.
+            """
+            while True:
+                try:
+                    time.sleep(30)
+                    conn = get_connection()
+                    try:
+                        rows = conn.execute(
+                            "SELECT * FROM positions WHERE status='open' "
+                            "AND is_simulated=1 AND hl_enabled=0 "
+                            "ORDER BY created_at ASC LIMIT 5"
+                        ).fetchall()
+                    finally:
+                        conn.close()
+
+                    for row in rows:
+                        pos = dict(row)
+                        pid = pos["id"]
+                        side = pos.get("side", "")
+                        sz = pos.get("position_size")
+                        leverage = pos.get("leverage", 20)
+                        tp = pos.get("target")
+                        sl = pos.get("stop")
+
+                        if not sz or not side or side not in ("long", "short"):
+                            continue
+
+                        router = get_router()
+                        logger.info(
+                            "[HL reconcile] opening mirrored position: id=%s side=%s size=%s",
+                            pid, side, sz,
+                        )
+                        result = router.open(side, round(float(sz), 6), int(leverage), tp, sl)
+
+                        if result.get("ok"):
+                            tp_oid = result.get("tp_oid")
+                            sl_oid = result.get("sl_oid")
+                            conn.execute(
+                                "UPDATE positions SET hl_enabled=1, hl_sz=?, hl_entry_oid=? "
+                                f", hl_tp_oid={'?' if tp_oid else 'NULL'}, hl_sl_oid={'?' if sl_oid else 'NULL'} "
+                                "WHERE id=? AND hl_enabled=0",
+                                (
+                                    round(float(sz), 6),
+                                    str(result.get("order_id")),
+                                    str(tp_oid) if tp_oid else None,
+                                    str(sl_oid) if sl_oid else None,
+                                    pid,
+                                ),
+                            )
+                            conn.commit()
+                            logger.info(
+                                "[HL reconcile] position mirrored: id=%s entry_oid=%s",
+                                pid, result.get("order_id"),
+                            )
+                        else:
+                            logger.warning(
+                                "[HL reconcile] open mirrored position failed: id=%s error=%s",
+                                pid, result.get("error"),
+                            )
+                except Exception:
+                    pass
+
+        threading.Thread(target=_hl_position_reconcile, daemon=True).start()
+
+        # Background HL TP/SL order reconciliation: detect missing or mismatched orders and recreate.
+        def _hl_order_reconcile():
+            """Reconcile HL TP/SL orders every 30s.
+
+            Detects orders that failed to place on open, or were cancelled
+            accidentally. Also handles passive fills where the oid was
+            consumed but the position still exists in DB. Additionally checks
+            that existing order sizes match hl_sz and recreates mismatches.
+            """
+            last_attempt: dict = {}  # position_id -> last retry timestamp
+            while True:
+                try:
+                    time.sleep(30)
+                    conn = get_connection()
+                    try:
+                        rows = conn.execute(
+                            "SELECT * FROM positions WHERE status='open' AND hl_enabled=1"
+                        ).fetchall()
+                    finally:
+                        conn.close()
+
+                    for row in rows:
+                        pos = dict(row)
+                        pid = pos["id"]
+                        now = time.time()
+                        last = last_attempt.get(pid, 0)
+                        if now - last < 60:
+                            continue
+
+                        sl_oid = pos.get("hl_sl_oid")
+                        tp_oid = pos.get("hl_tp_oid")
+                        sl_price = pos.get("stop")
+                        tp_price = pos.get("target")
+                        sz = pos.get("position_size") or pos.get("hl_sz")
+                        side = pos.get("side", "")
+
+                        need_sl = sl_price and (not sl_oid or sl_oid == "None")
+                        need_tp = tp_price and (not tp_oid or tp_oid == "None")
+
+                        router = get_router()
+
+                        # Fetch open orders once per position
+                        open_orders = []
+                        try:
+                            open_orders = router.get_open_orders()
+                        except Exception:
+                            pass
+
+                        # Verify SL: exists AND size matches hl_sz
+                        if sl_oid and sl_oid != "None":
+                            sl_order = next((o for o in open_orders if str(o.get("oid")) == str(sl_oid)), None)
+                            if not sl_order:
+                                logger.warning(
+                                    "[HL reconcile] SL oid=%s not found on exchange, recreating",
+                                    sl_oid,
+                                )
+                                need_sl = True
+                                conn.execute(
+                                    "UPDATE positions SET hl_sl_oid=NULL WHERE id=?",
+                                    (pid,),
+                                )
+                                conn.commit()
+                            elif sz and sl_order.get("sz"):
+                                order_sz = float(sl_order["sz"])
+                                expected_sz = round(float(sz), 6)
+                                if abs(order_sz - expected_sz) > 0.0001:
+                                    logger.info(
+                                        "[HL reconcile] SL size mismatch: order=%s expected=%s, canceling + recreating",
+                                        order_sz, expected_sz,
+                                    )
+                                    router.cancel_order(str(sl_oid))
+                                    need_sl = True
+                                    conn.execute(
+                                        "UPDATE positions SET hl_sl_oid=NULL WHERE id=?",
+                                        (pid,),
+                                    )
+                                    conn.commit()
+
+                        # Verify TP: exists AND size matches hl_sz
+                        if tp_oid and tp_oid != "None":
+                            tp_order = next((o for o in open_orders if str(o.get("oid")) == str(tp_oid)), None)
+                            if not tp_order:
+                                logger.warning(
+                                    "[HL reconcile] TP oid=%s not found on exchange, recreating",
+                                    tp_oid,
+                                )
+                                need_tp = True
+                                conn.execute(
+                                    "UPDATE positions SET hl_tp_oid=NULL WHERE id=?",
+                                    (pid,),
+                                )
+                                conn.commit()
+                            elif sz and tp_order.get("sz"):
+                                order_sz = float(tp_order["sz"])
+                                expected_sz = round(float(sz), 6)
+                                if abs(order_sz - expected_sz) > 0.0001:
+                                    logger.info(
+                                        "[HL reconcile] TP size mismatch: order=%s expected=%s, canceling + recreating",
+                                        order_sz, expected_sz,
+                                    )
+                                    router.cancel_order(str(tp_oid))
+                                    need_tp = True
+                                    conn.execute(
+                                        "UPDATE positions SET hl_tp_oid=NULL WHERE id=?",
+                                        (pid,),
+                                    )
+                                    conn.commit()
+
+                        # Recreate missing orders
+                        if need_sl and sl_price and sz:
+                            result = router.set_stop_loss("", sl_price, round(float(sz), 6), side)
+                            if result.get("ok"):
+                                conn.execute(
+                                    "UPDATE positions SET hl_sl_oid=? WHERE id=?",
+                                    (str(result["order_id"]), pid),
+                                )
+                                conn.commit()
+                                logger.info(
+                                    "[HL reconcile] SL recreated: oid=%s price=%s",
+                                    result["order_id"], sl_price,
+                                )
+                            else:
+                                logger.warning(
+                                    "[HL reconcile] SL recreate failed: %s",
+                                    result.get("error"),
+                                )
+
+                        if need_tp and tp_price and sz:
+                            result = router.set_take_profit("", tp_price, round(float(sz), 6), side)
+                            if result.get("ok"):
+                                conn.execute(
+                                    "UPDATE positions SET hl_tp_oid=? WHERE id=?",
+                                    (str(result["order_id"]), pid),
+                                )
+                                conn.commit()
+                                logger.info(
+                                    "[HL reconcile] TP recreated: oid=%s price=%s",
+                                    result["order_id"], tp_price,
+                                )
+                            else:
+                                logger.warning(
+                                    "[HL reconcile] TP recreate failed: %s",
+                                    result.get("error"),
+                                )
+
+                        if need_sl or need_tp:
+                            last_attempt[pid] = now
+                except Exception:
+                    pass
+
+        threading.Thread(target=_hl_order_reconcile, daemon=True).start()
+
+        # Background HL close reconciliation: detect positions where local DB
+        # was marked closed but HL position still exists (HL close failed).
+        def _hl_close_reconcile():
+            """Reconcile HL close state every 60s.
+
+            Catches the asymmetric failure: local DB status='closed' but
+            Hyperliquid position still open (e.g. HL close API timeout after
+            DB commit, or network failure during _hl_mirror_close).
+            """
+            reconciled: set = set()  # position IDs already reconciled
+            while True:
+                try:
+                    time.sleep(60)
+                    conn = get_connection()
+                    try:
+                        # Check recently closed HL positions (last 10 minutes)
+                        cutoff = time.time() - 600
+                        rows = conn.execute(
+                            "SELECT * FROM positions WHERE status='closed' "
+                            "AND hl_enabled=1 AND closed_at >= ? "
+                            "ORDER BY closed_at DESC LIMIT 10",
+                            (cutoff,),
+                        ).fetchall()
+                    finally:
+                        conn.close()
+
+                    for row in rows:
+                        pos = dict(row)
+                        pid = pos["id"]
+                        if pid in reconciled:
+                            continue
+
+                        # Check if HL still has an open position
+                        try:
+                            hl_pos = get_router().get_position_state()
+                        except Exception:
+                            continue  # HL query failed, retry next cycle
+
+                        if hl_pos and hl_pos.get("size") and hl_pos["size"] > 0:
+                            # HL still has position → force close it
+                            logger.warning(
+                                "[HL close reconcile] local DB closed but HL position still open: id=%s size=%s → force closing",
+                                pid, hl_pos["size"],
+                            )
+                            result = get_router().close(round(float(hl_pos["size"]), 6))
+                            if result.get("ok"):
+                                fill_price = result.get("fill_price")
+                                if fill_price and fill_price > 0:
+                                    entry = pos.get("entry_price") or 0
+                                    side = pos.get("side", "")
+                                    sz = float(hl_pos["size"])
+                                    if entry > 0:
+                                        actual_pnl = sz * (fill_price - entry) if side == "long" else sz * (entry - fill_price)
+                                        conn = get_connection()
+                                        try:
+                                            conn.execute(
+                                                "UPDATE positions SET pnl=?, close_price=? WHERE id=?",
+                                                (round(actual_pnl, 2), round(fill_price, 1), pid),
+                                            )
+                                            conn.commit()
+                                            logger.info(
+                                                "[HL close reconcile] PnL updated: fill=%s pnl=%s (was %s)",
+                                                fill_price, actual_pnl, pos.get("pnl"),
+                                            )
+                                        finally:
+                                            conn.close()
+                                logger.info("[HL close reconcile] force close succeeded: id=%s", pid)
+                            else:
+                                logger.warning("[HL close reconcile] force close failed: id=%s error=%s", pid, result.get("error"))
+
+                        # Mark as reconciled regardless — if HL was already
+                        # closed (passive TP/SL fill) no action needed.
+                        reconciled.add(pid)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_hl_close_reconcile, daemon=True).start()
 
 
 # ---------- Pages ----------
@@ -322,44 +828,50 @@ def _build_cache_path_response(cached: dict) -> dict:
     """Cache hit path: deep-copy verdict and refresh live price."""
     conn = get_connection()
     try:
-        history_rows_raw = conn.execute(
-            "SELECT * FROM verdict_history ORDER BY created_at DESC LIMIT 50"
-        ).fetchall()
-        history_rows = []
-        for r in history_rows_raw:
-            history_rows.append({
-                "regime": r["regime"], "direction": r["direction"],
-                "strength": r["strength"], "confidence": r["confidence"],
-                "momentum": r["momentum"], "advice": r["advice"],
-                "price": r["price"], "adx_4h": r["adx_4h"], "adx_1h": r["adx_1h"],
-                "dir_4h": r["dir_4h"], "dir_1h": r["dir_1h"],
-                "created_at": r["created_at"],
-            })
+        # Deep-copy cached data, refresh price BEFORE position management
+        data = copy.deepcopy(cached["data"])
 
-        verdict_history = []
-        for r in history_rows:
-            dt = datetime.fromtimestamp(r.get("created_at", time.time())).strftime("%m-%d %H:%M")
-            verdict_history.append({**r, "time": dt})
-        # 连续相同去重
-        deduped = []
-        for h in verdict_history:
-            if not deduped or deduped[-1]["regime"] != h["regime"] or deduped[-1]["direction"] != h["direction"]:
-                deduped.append(h)
-        verdict_history = deduped
+        # Reuse verdict_history and m30_snapshots from cached data —
+        # these don't change between cache hits (only written on full rebuild).
+        if "verdict_history" not in data:
+            history_rows_raw = conn.execute(
+                "SELECT * FROM verdict_history ORDER BY created_at DESC LIMIT 50"
+            ).fetchall()
+            history_rows = []
+            for r in history_rows_raw:
+                history_rows.append({
+                    "regime": r["regime"], "direction": r["direction"],
+                    "strength": r["strength"], "confidence": r["confidence"],
+                    "momentum": r["momentum"], "advice": r["advice"],
+                    "price": r["price"], "adx_4h": r["adx_4h"], "adx_1h": r["adx_1h"],
+                    "dir_4h": r["dir_4h"], "dir_1h": r["dir_1h"],
+                    "created_at": r["created_at"],
+                })
+            verdict_history = []
+            for r in history_rows:
+                dt = datetime.fromtimestamp(r.get("created_at", time.time())).strftime("%m-%d %H:%M")
+                verdict_history.append({**r, "time": dt})
+            deduped = []
+            for h in verdict_history:
+                if not deduped or deduped[-1]["regime"] != h["regime"] or deduped[-1]["direction"] != h["direction"]:
+                    deduped.append(h)
+            data["verdict_history"] = deduped
 
-        snapshots = conn.execute(
-            "SELECT regime, direction, adx, plus_di, minus_di, price_at_signal, created_at "
-            "FROM signals WHERE timeframe = '30m' ORDER BY created_at DESC LIMIT 10"
-        ).fetchall()
-        m30_snapshots = []
-        for s in snapshots:
-            dt = datetime.fromtimestamp(s["created_at"]).strftime("%H:%M:%S")
-            m30_snapshots.append({
-                "ts": s["created_at"], "time": dt,
-                "price": s["price_at_signal"], "adx": s["adx"],
-                "plus_di": s["plus_di"], "minus_di": s["minus_di"],
-                "regime": s["regime"], "direction": s["direction"],
-            })
+        if "m30_snapshots" not in data:
+            snapshots = conn.execute(
+                "SELECT regime, direction, adx, plus_di, minus_di, price_at_signal, created_at "
+                "FROM signals WHERE timeframe = '30m' ORDER BY created_at DESC LIMIT 10"
+            ).fetchall()
+            m30_snapshots = []
+            for s in snapshots:
+                dt = datetime.fromtimestamp(s["created_at"]).strftime("%H:%M:%S")
+                m30_snapshots.append({
+                    "ts": s["created_at"], "time": dt,
+                    "price": s["price_at_signal"], "adx": s["adx"],
+                    "plus_di": s["plus_di"], "minus_di": s["minus_di"],
+                    "regime": s["regime"], "direction": s["direction"],
+                })
+            data["m30_snapshots"] = m30_snapshots
 
         # Get open position for state machine (manual only)
         open_position = conn.execute(
@@ -367,20 +879,25 @@ def _build_cache_path_response(cached: dict) -> dict:
         ).fetchone()
         position_dict = dict(open_position) if open_position else None
 
-        # Deep-copy cached data, refresh price BEFORE position management
-        data = copy.deepcopy(cached["data"])
-
         # Fetch live price first — manage_simulated_position needs current
-        # price for accurate stop-loss/take-profit checks
+        # price for accurate stop-loss/take-profit checks. Retry once on failure
+        # to avoid using stale cached price for position operations.
+        live_price = None
         try:
             live_price = fetch_price(settings.binance_symbol)
-            if live_price:
-                data["ticker"]["price"] = live_price
         except Exception:
-            pass  # fall back to cached price
-
-        # Now manage positions with the freshest price available
-        manage_simulated_position(conn, data, data["ticker"]["price"])
+            logger.warning("fetch_price failed, retrying once")
+        if not live_price:
+            try:
+                live_price = fetch_price(settings.binance_symbol)
+            except Exception:
+                logger.warning("fetch_price retry failed, skipping position management")
+        if live_price:
+            data["ticker"]["price"] = live_price
+            # Now manage positions with fresh price
+            manage_simulated_position(conn, data, live_price)
+        else:
+            logger.warning("no live price available — skipping manage_simulated_position to avoid stale-price decisions")
 
         # Save planned entry price before _refresh_live_prices overwrites it
         _planned_entry = data["verdict"].get("order_signal", {}).get("entry_price")
@@ -391,15 +908,24 @@ def _build_cache_path_response(cached: dict) -> dict:
         sim_row = conn.execute(
             "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 1 ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
+        if sim_row:
+            sim = dict(sim_row)
+            orig = conn.execute(
+                "SELECT position_size FROM position_action_state "
+                "WHERE position_id = ? AND action = 'open' LIMIT 1",
+                (sim["id"],),
+            ).fetchone()
+            if orig and orig["position_size"]:
+                sim["original_size"] = orig["position_size"]
+            data["simulated_position"] = sim
+        else:
+            data["simulated_position"] = None
 
         # Evolution uses same conn (avoids extra DB open/close)
         evolution_data = _build_evolution(conn)
 
-        data["verdict_history"] = verdict_history
-        data["m30_snapshots"] = m30_snapshots
         data["timestamp"] = datetime.now().isoformat()
         data["evolution"] = evolution_data
-        data["simulated_position"] = dict(sim_row) if sim_row else None
 
         # Reload per-TF base thresholds after evolution may have adjusted them
         ev_params = get_active_thresholds()
@@ -430,9 +956,6 @@ def _build_cache_path_response(cached: dict) -> dict:
 
 def _rebuild_signals_response(now: float = None) -> dict:
     """Cache miss: full signal generation from Binance."""
-    import logging
-    logger = logging.getLogger('btc_signal')
-
     conn = get_connection()
     try:
         # Query history rows and open position BEFORE generating verdict
@@ -530,6 +1053,23 @@ def _rebuild_signals_response(now: float = None) -> dict:
                 is_persistent = agg_key in ("aggressive_pattern_breakout", "aggressive_squeeze_breakout")
                 last_aggressive = f"{agg_key},{is_persistent}"
                 break
+
+        # Exhaustion block dedup: count consecutive same-direction trend_exhaustion_block
+        # signals. When ADX > 50 and 3+ consecutive signals are identical, suppress
+        # generating another one to avoid polluting verification stats.
+        eb_rows = conn.execute(
+            "SELECT direction, signal_type FROM signals WHERE timeframe = '4h' "
+            "AND signal_type = 'trend_exhaustion_block' ORDER BY created_at DESC LIMIT 5"
+        ).fetchall()
+        eb_consecutive_same_dir = 0
+        eb_last_dir = None
+        for r in eb_rows:
+            d = r["direction"]
+            if d == eb_last_dir or eb_last_dir is None:
+                eb_consecutive_same_dir += 1
+                eb_last_dir = d
+            else:
+                break
     
         market_ctx = {
             "funding_rate": funding_rate,
@@ -540,19 +1080,22 @@ def _rebuild_signals_response(now: float = None) -> dict:
             "recent_p3_signals": recent_p3_signals,
             "aggressive_cooldowns": aggressive_cooldowns,
             "last_aggressive_signal": last_aggressive,
+            "exhaustion_block_consecutive": eb_consecutive_same_dir,
         }
 
         # Query previous per-TF regimes for hysteresis
         previous_regimes = {}
         for tf in ("30m", "1h", "4h"):
             row = conn.execute(
-                "SELECT regime, direction FROM signals WHERE timeframe = ? ORDER BY created_at DESC LIMIT 1",
+                "SELECT regime, direction, signal_type FROM signals WHERE timeframe = ? ORDER BY created_at DESC LIMIT 1",
                 (tf,),
             ).fetchone()
             if row:
                 previous_regimes[tf] = row["regime"]
                 if row["direction"]:
                     previous_regimes[f"{tf}_direction"] = row["direction"]
+                if row["signal_type"]:
+                    previous_regimes[f"{tf}_signal_type"] = row["signal_type"]
 
         data = generate_verdict(
             history_rows=history_rows,
@@ -576,29 +1119,27 @@ def _rebuild_signals_response(now: float = None) -> dict:
                 latest_signals[tf] = (row["regime"], row["direction"], row["verdict"], row["action"])
     
         signal_changed = False
-        # Per-TF candle cooldown: prevent duplicate signals within same candle window.
+        # Per-TF signal recording: always record the latest signal for each new candle.
+        # If a signal for the current candle already exists, UPDATE it with fresh data.
+        # This keeps snapshots fresh even when regime/direction doesn't change.
         CANDLE_SECONDS = {"30m": 1800, "1h": 3600, "4h": 14400}
         for tf, tf_data in data["timeframes"].items():
-            prev = latest_signals.get(tf)
-            new_sig = (tf_data["regime"], tf_data["direction"], data["verdict"]["direction"], data["verdict"]["advice"]["action"])
-            if prev is None or prev != new_sig:
-                # Check if a signal was already created in the current candle period
-                tf_seconds = CANDLE_SECONDS.get(tf, 3600)
-                candle_start = now - (now % tf_seconds)
-                existing = conn.execute(
-                    "SELECT id FROM signals WHERE timeframe = ? AND created_at >= ? LIMIT 1",
-                    (tf, candle_start),
-                ).fetchone()
-                if existing:
-                    continue  # Skip: already have a signal for this candle
-                signal_changed = True
+            tf_seconds = CANDLE_SECONDS.get(tf, 3600)
+            candle_start = now - (now % tf_seconds)
+
+            # Check if we already recorded a signal for this candle
+            existing = conn.execute(
+                "SELECT id FROM signals WHERE timeframe = ? AND created_at >= ? LIMIT 1",
+                (tf, candle_start),
+            ).fetchone()
+            if existing:
+                # Update the existing record with latest ADX/DI/price (real-time candle data)
                 conn.execute(
-                    "INSERT INTO signals (timeframe, regime, direction, adx, plus_di, minus_di, "
-                    "confidence, strength, momentum, duration_hours, price_at_signal, "
-                    "verdict, action, target, stop, signal_type, created_at, verified) VALUES "
-                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    "UPDATE signals SET regime=?, direction=?, adx=?, plus_di=?, minus_di=?, "
+                    "confidence=?, strength=?, momentum=?, duration_hours=?, price_at_signal=?, "
+                    "verdict=?, action=?, target=?, stop=?, signal_type=? WHERE timeframe=? AND created_at >= ?",
                     (
-                        tf, tf_data["regime"], tf_data["direction"], tf_data["adx"],
+                        tf_data["regime"], tf_data["direction"], tf_data["adx"],
                         tf_data["plus_di"], tf_data["minus_di"], tf_data["confidence"],
                         tf_data.get("strength"), tf_data.get("momentum"),
                         tf_data.get("duration_hours"), tf_data["price"],
@@ -607,22 +1148,47 @@ def _rebuild_signals_response(now: float = None) -> dict:
                         data["verdict"]["advice"]["target"],
                         data["verdict"]["advice"]["stop"],
                         tf_data.get("signal_type", "trend_following"),
-                        now,
+                        tf, candle_start,
                     ),
                 )
+                continue
+
+            # New candle -> insert fresh signal record
+            signal_changed = True
+            conn.execute(
+                "INSERT INTO signals (timeframe, regime, direction, adx, plus_di, minus_di, "
+                "confidence, strength, momentum, duration_hours, price_at_signal, "
+                "verdict, action, target, stop, signal_type, created_at, verified) VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                (
+                    tf, tf_data["regime"], tf_data["direction"], tf_data["adx"],
+                    tf_data["plus_di"], tf_data["minus_di"], tf_data["confidence"],
+                    tf_data.get("strength"), tf_data.get("momentum"),
+                    tf_data.get("duration_hours"), tf_data["price"],
+                    data["verdict"]["direction"],
+                    data["verdict"]["advice"]["action"],
+                    data["verdict"]["advice"]["target"],
+                    data["verdict"]["advice"]["stop"],
+                    tf_data.get("signal_type", "trend_following"),
+                    now,
+                ),
+            )
     
         if signal_changed:
             # Dedup verdict_history: only insert when verdict actually changed,
-            # AND at least 30 minutes since last entry (prevents regime flip-flop).
+            # OR enough time has passed (heartbeat for same-state persistence).
             last_verdict = conn.execute(
                 "SELECT regime, direction, strength, created_at FROM verdict_history ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
             verdict_key = (data["verdict"]["regime"], data["verdict"]["direction"], data["verdict"]["strength"])
-            min_interval = 1800  # 30 minutes between verdict entries
+            min_interval = 1800   # 30 min minimum for changed verdicts
+            heartbeat_interval = 7200  # 2 hour heartbeat for unchanged verdicts
+
             if last_verdict is None:
                 should_insert = True
             elif (last_verdict["regime"], last_verdict["direction"], last_verdict["strength"]) == verdict_key:
-                should_insert = False  # exact same verdict
+                # Same verdict — only insert a heartbeat entry every 2 hours
+                should_insert = (now - last_verdict["created_at"]) >= heartbeat_interval
             elif (now - last_verdict["created_at"]) < min_interval:
                 should_insert = False  # too soon, skip
             else:
@@ -686,18 +1252,19 @@ def _rebuild_signals_response(now: float = None) -> dict:
         data["verdict"]["price_at_signal"] = data["ticker"]["price"]
         data["evolution"] = _build_evolution(conn)
     
-        # Manage simulated positions
+        # Fetch fresh price BEFORE position management — K-line close price may be stale.
+        # _refresh_live_prices fetches from Binance ticker and updates data["ticker"]["price"].
+        _refresh_live_prices(data, None)  # None = force fetch from Binance
+
+        # Manage simulated positions with fresh price
         manage_simulated_position(conn, data, data["ticker"]["price"])
 
-        # Save planned entry price BEFORE _refresh_live_prices overwrites entry_price
+        # Save planned entry price AFTER position management (order_signal may be updated)
         _planned_entry = data["verdict"].get("order_signal", {}).get("entry_price")
         if _planned_entry is not None:
             data["verdict"]["order_signal"]["planned_entry_price"] = _planned_entry
 
-        # 同步实时价格，确保 ticker.price 和 timeframes['30m'].price 一致
-        _refresh_live_prices(data, data.get("ticker", {}).get("price"))
-    
-        # Query simulated position for response
+        # Re-query simulated position for response
         sim_row = conn.execute(
             "SELECT * FROM positions WHERE status = 'open' AND is_simulated = 1 ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
@@ -770,7 +1337,8 @@ async def api_close_position(position_id: int, request: Request):
 
     hl_result = None
     if row["hl_enabled"]:
-        hl_result = hl_close_position(row.get("hl_sz"))
+        router = get_router()
+        hl_result = router.close(row.get("hl_sz") or 0)
 
     now = time.time()
     current_price = fetch_price(settings.binance_symbol) or row["entry_price"]
@@ -796,7 +1364,7 @@ async def api_close_position(position_id: int, request: Request):
     if row["hl_enabled"]:
         if hl_result and hl_result.get("ok"):
             resp["hyperliquid"] = True
-            resp["oid"] = hl_result.get("oid")
+            resp["oid"] = hl_result.get("order_id")
         else:
             resp["hyperliquid"] = False
             resp["error"] = hl_result.get("error", "Close failed") if hl_result else "Close failed"
@@ -953,12 +1521,6 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
                 "ORDER BY created_at",
                 (rd["id"],),
             ).fetchall()
-            orig = conn.execute(
-                "SELECT position_size FROM position_action_state "
-                "WHERE position_id = ? AND action = 'open' LIMIT 1",
-                (rd["id"],),
-            ).fetchone()
-            prev_size = orig["position_size"] if orig else rd["position_size"]
             entry = rd["entry_price"]
             side = rd["side"]
             for red in reduces:
@@ -974,7 +1536,6 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
                 red_rec["action_id"] = None
                 red_rec["duration_hours"] = None
                 all_records.append(red_rec)
-                prev_size = reduced_amt
 
     for r in closed_rows:
         rd = dict(r)
@@ -996,12 +1557,6 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
                 "ORDER BY created_at",
                 (rd["id"],),
             ).fetchall()
-            orig = conn.execute(
-                "SELECT position_size FROM position_action_state "
-                "WHERE position_id = ? AND action = 'open' LIMIT 1",
-                (rd["id"],),
-            ).fetchone()
-            prev_size = orig["position_size"] if orig else rd["position_size"]
             entry = rd["entry_price"]
             side = rd["side"]
             for red in reduces:
@@ -1017,7 +1572,6 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
                 red_rec["action_id"] = None
                 red_rec["duration_hours"] = None
                 all_records.append(red_rec)
-                prev_size = reduced_amt
 
         # Close row
         close_rec = dict(rd)
@@ -1162,6 +1716,157 @@ async def api_simulated_position_stats(request: Request):
         "losses": total_trades - wins,
         "equity_curve": equity_curve,
     }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Hyperliquid Live Trading API Endpoints
+# ──────────────────────────────────────────────────────────────────────
+
+@app.get("/api/hyperliquid/portfolio")
+async def api_hl_portfolio(request: Request):
+    if not require_auth(request):
+        return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
+    try:
+        viewer = get_viewer()
+        return viewer.get_portfolio()
+    except Exception as e:
+        return JSONResponse({"detail": str(e)}, status_code=500)
+
+
+@app.get("/api/hyperliquid/positions")
+async def api_hl_positions(request: Request):
+    if not require_auth(request):
+        return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
+    try:
+        viewer = get_viewer()
+        return viewer.get_positions()
+    except Exception as e:
+        return JSONResponse({"detail": str(e)}, status_code=500)
+
+
+@app.get("/api/hyperliquid/orders")
+async def api_hl_orders(request: Request):
+    if not require_auth(request):
+        return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
+    try:
+        viewer = get_viewer()
+        return viewer.get_open_orders()
+    except Exception as e:
+        return JSONResponse({"detail": str(e)}, status_code=500)
+
+
+@app.get("/api/hyperliquid/fills")
+async def api_hl_fills(request: Request, page: int = 1, size: int = 50):
+    if not require_auth(request):
+        return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
+    try:
+        viewer = get_viewer()
+        return viewer.get_fills(page=page, size=size)
+    except Exception as e:
+        return JSONResponse({"detail": str(e)}, status_code=500)
+
+
+@app.get("/api/hyperliquid/funding")
+async def api_hl_funding(request: Request, hours: int = 24):
+    if not require_auth(request):
+        return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
+    try:
+        viewer = get_viewer()
+        return viewer.get_funding_history(hours=hours)
+    except Exception as e:
+        return JSONResponse({"detail": str(e)}, status_code=500)
+
+
+@app.get("/api/hyperliquid/fees")
+async def api_hl_fees(request: Request):
+    if not require_auth(request):
+        return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
+    try:
+        viewer = get_viewer()
+        return viewer.get_fee_stats()
+    except Exception as e:
+        return JSONResponse({"detail": str(e)}, status_code=500)
+
+
+@app.get("/api/hyperliquid/net_curve")
+async def api_hl_net_curve(request: Request, period: str = "7d"):
+    if not require_auth(request):
+        return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
+    try:
+        viewer = get_viewer()
+        return viewer.get_net_value_curve(period=period)
+    except Exception as e:
+        return JSONResponse({"detail": str(e)}, status_code=500)
+
+
+@app.get("/api/hyperliquid/pnl_curve")
+async def api_hl_pnl_curve(request: Request, days: int = 7):
+    """Perps PnL curve: cumulative closed PnL from fills over the last N days.
+
+    Returns:
+      - curve: cumulative PnL from close fills
+      - total_pnl: realized PnL (sum of closed_pnl from all fills)
+      - total_fees: all trading fees paid
+      - unrealized_pnl: current open position PnL
+      - net_pnl: total_pnl + total_fees + unrealized_pnl (actual account change)
+      - fill_count: number of fills with non-zero closed_pnl
+    """
+    if not require_auth(request):
+        return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
+    try:
+        viewer = get_viewer()
+        fills_data = viewer.get_fills(page=1, size=10000, coin="BTC")
+        all_fills = fills_data.get("fills", [])
+
+        # Filter by time window for curve
+        cutoff_ms = (time.time() - days * 86400) * 1000
+        recent = [f for f in all_fills if f.get("timestamp", 0) >= cutoff_ms]
+        recent.sort(key=lambda f: f.get("timestamp", 0))
+
+        # Build cumulative PnL curve
+        cum_pnl = 0
+        curve = []
+        for f in recent:
+            pnl = f.get("closed_pnl", 0)
+            if pnl != 0:
+                cum_pnl += pnl
+                ts = f["timestamp"]
+                dt = datetime.fromtimestamp(ts / 1000).strftime("%m-%d %H:%M")
+                curve.append({"timestamp": ts, "date": dt, "cum_pnl": round(cum_pnl, 2)})
+
+        # Ensure at least one point (start at 0)
+        if curve and (curve[0]["cum_pnl"] != 0 or len(curve) > 1):
+            first_ts = curve[0]["timestamp"]
+            first_dt = curve[0]["date"]
+            curve.insert(0, {"timestamp": first_ts, "date": first_dt, "cum_pnl": 0})
+        elif not curve:
+            now_ts = int(time.time() * 1000)
+            now_dt = datetime.fromtimestamp(now_ts / 1000).strftime("%m-%d %H:%M")
+            curve = [{"timestamp": now_ts, "date": now_dt, "cum_pnl": 0}]
+
+        # Total realized PnL from ALL fills (not just recent window)
+        total_pnl = sum(f.get("closed_pnl", 0) for f in all_fills)
+        # Total fees from all fills
+        total_fees = sum(-abs(float(f.get("fee", 0))) for f in all_fills)
+
+        # Current unrealized PnL
+        positions = viewer.get_positions()
+        unrealized_pnl = sum(p.get("unrealized_pnl", 0) for p in positions if "error" not in p)
+
+        # Net PnL = realized + fees + unrealized
+        net_pnl = total_pnl + total_fees + unrealized_pnl
+
+        return {
+            "curve": curve,
+            "total_pnl": round(total_pnl, 2),
+            "total_fees": round(total_fees, 2),
+            "unrealized_pnl": round(unrealized_pnl, 2),
+            "net_pnl": round(net_pnl, 2),
+            "fill_count": len([f for f in recent if f.get("closed_pnl", 0) != 0]),
+        }
+    except Exception as e:
+        _logger.exception("HL pnl_curve failed")
+        return JSONResponse({"detail": str(e)}, status_code=500)
 
 
 if __name__ == "__main__":

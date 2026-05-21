@@ -228,6 +228,58 @@ def init_db():
         "WHERE max_price IS NULL OR min_price IS NULL"
     )
 
+    # Signal metadata: record signal context at open time
+    for col_sql in [
+        "ALTER TABLE positions ADD COLUMN signal_regime TEXT",
+        "ALTER TABLE positions ADD COLUMN signal_strength TEXT",
+        "ALTER TABLE positions ADD COLUMN signal_confidence INTEGER",
+        "ALTER TABLE positions ADD COLUMN signal_adx_4h REAL",
+        "ALTER TABLE positions ADD COLUMN signal_adx_1h REAL",
+        "ALTER TABLE positions ADD COLUMN signal_verdict_dir TEXT",
+        "ALTER TABLE positions ADD COLUMN original_stop REAL",
+        "ALTER TABLE positions ADD COLUMN trailing_stop REAL",
+        "ALTER TABLE positions ADD COLUMN stop_update_reason TEXT",
+        "ALTER TABLE positions ADD COLUMN highest_pnl_pct REAL DEFAULT 0",
+        "ALTER TABLE positions ADD COLUMN hl_tp_oid TEXT",
+        "ALTER TABLE positions ADD COLUMN hl_sl_oid TEXT",
+        "ALTER TABLE positions ADD COLUMN hl_fees REAL DEFAULT 0",
+        "ALTER TABLE positions ADD COLUMN funding_paid REAL DEFAULT 0",
+    ]:
+        try:
+            c.execute(col_sql)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    # Order ID in position_action_state for trade tracking
+    try:
+        c.execute("ALTER TABLE position_action_state ADD COLUMN order_id TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # K-line persistent cache table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS klines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            ts REAL NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL NOT NULL,
+            UNIQUE(symbol, timeframe, ts)
+        )
+    """)
+
+    # Index for fast time-range queries
+    try:
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_klines_tf_ts ON klines(symbol, timeframe, ts)"
+        )
+    except sqlite3.OperationalError:
+        pass
+
     # Create default user (use salted hash from auth module)
     from app.auth import hash_password
     pw_hash = hash_password(settings.password)

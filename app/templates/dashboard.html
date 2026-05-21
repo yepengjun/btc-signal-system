@@ -660,6 +660,7 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
         <button class="tab-btn" :class="{active: tab==='signals'}" @click="tab='signals'">信号</button>
         <button class="tab-btn" :class="{active: tab==='position'}" @click="tab='position'">持仓</button>
         <button class="tab-btn" :class="{active: tab==='evolution'}" @click="tab='evolution'">进化</button>
+        <button class="tab-btn" :class="{active: tab==='live'}" @click="tab='live'">实盘</button>
       </div>
       <div class="user-bar">
         <div class="live-badge">
@@ -1429,6 +1430,180 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
         </div>
       </div>
     </template>
+
+    <!-- ═══ 实盘 Tab ═══ -->
+    <template v-if="tab==='live'">
+      <div class="evo-section">
+        <h3>Hyperliquid 实盘</h3>
+
+        <!-- Portfolio Summary -->
+        <div class="evo-overview" v-if="hlPortfolio">
+          <div class="evo-stat">
+            <div class="evo-stat-label">账户净值</div>
+            <div class="evo-stat-value">${{ hlPortfolio.account_value?.toFixed(2) || '0.00' }}</div>
+          </div>
+          <div class="evo-stat">
+            <div class="evo-stat-label">可用余额</div>
+            <div class="evo-stat-value">${{ hlPortfolio.free_collateral?.toFixed(2) || '0.00' }}</div>
+          </div>
+          <div class="evo-stat">
+            <div class="evo-stat-label">已用保证金</div>
+            <div class="evo-stat-value">${{ hlPortfolio.margin_used?.toFixed(2) || '0.00' }}</div>
+          </div>
+          <div class="evo-stat">
+            <div class="evo-stat-label">总PnL</div>
+            <div class="evo-stat-value" :style="{color: (hlPnlStats?.net_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">
+              {{ (hlPnlStats?.net_pnl || 0) >= 0 ? '+$' : '-$' }}{{ Math.abs(hlPnlStats?.net_pnl || 0).toFixed(2) }}
+            </div>
+          </div>
+          <div class="evo-stat">
+            <div class="evo-stat-label">杠杆倍数</div>
+            <div class="evo-stat-value">{{ hlPortfolio.leverage_ratio?.toFixed(1) || '0.0' }}x</div>
+          </div>
+          <div class="evo-stat">
+            <div class="evo-stat-label">成交笔数</div>
+            <div class="evo-stat-value">{{ hlPnlStats?.fill_count || 0 }}</div>
+          </div>
+        </div>
+        <div v-else style="font-size:13px;color:#6b7280;padding:16px;text-align:center">加载中...</div>
+
+        <!-- PnL Curve Chart -->
+        <div class="sim-equity" v-if="hlPnlCurve && hlPnlCurve.length >= 2">
+          <div class="sim-history-title">Perps PnL 曲线 (7天)</div>
+          <div ref="pnlChartRef" style="height:220px"></div>
+        </div>
+        <div v-else-if="hlPnlStats" style="font-size:13px;color:#6b7280;padding:24px;text-align:center;background:#0d1220;border-radius:8px;border:1px solid #1f2937;margin-top:12px">
+          7天内无平仓记录
+        </div>
+
+        <!-- PnL Breakdown -->
+        <div v-if="hlPnlStats" style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:16px;padding:12px;background:#0d1220;border-radius:8px;border:1px solid #1f2937">
+          <div style="text-align:center">
+            <div style="font-size:11px;color:#6b7280">已实现PnL</div>
+            <div :style="{color: (hlPnlStats.total_pnl || 0) >= 0 ? '#22c55e' : '#ef4444', fontSize:'14px',fontWeight:'600'}">
+              {{ (hlPnlStats.total_pnl || 0) >= 0 ? '+$' : '-$' }}{{ Math.abs(hlPnlStats.total_pnl || 0).toFixed(2) }}
+            </div>
+          </div>
+          <div style="text-align:center">
+            <div style="font-size:11px;color:#6b7280">手续费</div>
+            <div style="color:#f59e0b;font-size:14px;font-weight:600">-${{ Math.abs(hlPnlStats.total_fees || 0).toFixed(2) }}</div>
+          </div>
+          <div style="text-align:center">
+            <div style="font-size:11px;color:#6b7280">未实现PnL</div>
+            <div :style="{color: (hlPnlStats.unrealized_pnl || 0) >= 0 ? '#22c55e' : '#ef4444', fontSize:'14px',fontWeight:'600'}">
+              {{ (hlPnlStats.unrealized_pnl || 0) >= 0 ? '+$' : '-$' }}{{ Math.abs(hlPnlStats.unrealized_pnl || 0).toFixed(2) }}
+            </div>
+          </div>
+        </div>
+
+        <!-- Current Positions -->
+        <h3 style="margin-top:24px">当前持仓</h3>
+        <div v-if="hlPositions && hlPositions.length > 0" style="overflow-x:auto">
+          <table class="recent-table">
+            <thead>
+              <tr>
+                <th>币种</th><th>方向</th><th>数量</th><th>开仓价</th><th>标记价</th><th>未实现PnL</th><th>ROE</th><th>杠杆</th><th>强平价</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="p in hlPositions" :key="p.coin + p.side">
+                <td>{{ p.coin }}</td>
+                <td :style="{color: p.side === 'long' ? '#22c55e' : '#ef4444'}">{{ p.side === 'long' ? '多' : '空' }}</td>
+                <td>{{ p.size?.toFixed(4) }}</td>
+                <td>${{ p.entry_price?.toFixed(1) }}</td>
+                <td>${{ p.mark_price?.toFixed(1) }}</td>
+                <td :style="{color: (p.unrealized_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">
+                  {{ (p.unrealized_pnl || 0) >= 0 ? '+$' : '-$' }}{{ Math.abs(p.unrealized_pnl || 0).toFixed(2) }}
+                </td>
+                <td :style="{color: (p.roe_pct || 0) >= 0 ? '#22c55e' : '#ef4444'}">
+                  {{ (p.roe_pct || 0) >= 0 ? '+' : '' }}{{ p.roe_pct?.toFixed(2) }}%
+                </td>
+                <td>{{ p.leverage }}x</td>
+                <td>${{ p.liquidation_price?.toFixed(1) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-else style="font-size:13px;color:#6b7280;padding:12px;text-align:center;background:#0d1220;border-radius:8px;border:1px solid #1f2937">暂无持仓</div>
+
+        <!-- Open Orders -->
+        <h3 style="margin-top:24px">挂单</h3>
+        <div v-if="hlOrders && hlOrders.length > 0" style="overflow-x:auto">
+          <table class="recent-table">
+            <thead>
+              <tr>
+                <th>OID</th><th>方向</th><th>数量</th><th>价格</th><th>类型</th><th>只减仓</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="o in hlOrders" :key="o.oid">
+                <td style="font-size:10px;color:#9ca3af">{{ o.oid?.slice(0, 8) }}</td>
+                <td :style="{color: o.side === 'B' ? '#22c55e' : '#ef4444'}">{{ o.side === 'B' ? '买入' : '卖出' }}</td>
+                <td>{{ o.size?.toFixed(4) }}</td>
+                <td>${{ o.price?.toFixed(1) }}</td>
+                <td>{{ o.type }}</td>
+                <td>{{ o.reduce_only ? '是' : '否' }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-else style="font-size:13px;color:#6b7280;padding:12px;text-align:center;background:#0d1220;border-radius:8px;border:1px solid #1f2937">暂无挂单</div>
+
+        <!-- Trade History (Fills) -->
+        <h3 style="margin-top:24px">成交历史</h3>
+        <div v-if="hlFills && hlFills.fills && hlFills.fills.length > 0" style="overflow-x:auto">
+          <table class="recent-table">
+            <thead>
+              <tr>
+                <th>时间</th><th>方向</th><th>数量</th><th>价格</th><th>手续费</th><th>已实现PnL</th><th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="f in hlFills.fills" :key="f.oid + f.timestamp">
+                <td>{{ fmtTime(f.timestamp / 1000) }}</td>
+                <td :style="{color: f.side === 'long' ? '#22c55e' : '#ef4444'}">{{ f.side === 'long' ? '多' : '空' }}</td>
+                <td>{{ f.size?.toFixed(4) }}</td>
+                <td>${{ f.price?.toFixed(1) }}</td>
+                <td>${{ f.fee?.toFixed(2) }}</td>
+                <td :style="{color: (f.closed_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">
+                  {{ (f.closed_pnl || 0) >= 0 ? '+$' : '-$' }}{{ Math.abs(f.closed_pnl || 0).toFixed(2) }}
+                </td>
+                <td>{{ f.dir }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <!-- Pagination -->
+          <div style="display:flex;justify-content:center;gap:8px;margin-top:12px;align-items:center">
+            <button class="sim-page-btn" :disabled="hlFills.page <= 1" @click="hlPagePrev">上一页</button>
+            <span style="font-size:12px;color:#9ca3af">第 {{ hlFills.page }} / {{ hlFills.total_pages }} 页 (共 {{ hlFills.total }} 条)</span>
+            <button class="sim-page-btn" :disabled="hlFills.page >= hlFills.total_pages" @click="hlPageNext">下一页</button>
+          </div>
+        </div>
+        <div v-else style="font-size:13px;color:#6b7280;padding:12px;text-align:center;background:#0d1220;border-radius:8px;border:1px solid #1f2937">暂无成交记录</div>
+
+        <!-- Fee Stats -->
+        <h3 style="margin-top:24px">手续费统计</h3>
+        <div class="evo-overview" v-if="hlFees">
+          <div class="evo-stat">
+            <div class="evo-stat-label">总手续费</div>
+            <div class="evo-stat-value">${{ hlFees.total_fees?.toFixed(2) || '0.00' }}</div>
+          </div>
+          <div class="evo-stat">
+            <div class="evo-stat-label">总成交量</div>
+            <div class="evo-stat-value">${{ hlFees.total_volume?.toFixed(2) || '0.00' }}</div>
+          </div>
+          <div class="evo-stat">
+            <div class="evo-stat-label">成交笔数</div>
+            <div class="evo-stat-value">{{ hlFees.fill_count }}</div>
+          </div>
+          <div class="evo-stat">
+            <div class="evo-stat-label">平均费率</div>
+            <div class="evo-stat-value">{{ hlFees.avg_fee_bps?.toFixed(1) }} bps</div>
+          </div>
+        </div>
+        <div v-else style="font-size:13px;color:#6b7280;padding:12px;text-align:center">加载中...</div>
+      </div>
+    </template>
   </div>
 
   <footer>
@@ -1460,6 +1635,47 @@ createApp({
     const simStats = ref({ initial_balance: 10000, current_balance: 10000, realized_pnl: 0, today_pnl: 0, total_trades: 0, today_trades: 0, available_balance: 10000, margin_used: 0, win_rate: 0, wins: 0, losses: 0 });
     const simEquityCurve = ref([]);
     const equityChartRef = ref(null);
+
+    // ── Hyperliquid 实盘 ──
+    const hlPortfolio = ref(null);
+    const hlPositions = ref([]);
+    const hlOrders = ref([]);
+    const hlFills = ref({ fills: [], total: 0, page: 1, total_pages: 1 });
+    const hlFees = ref(null);
+    const hlPnlStats = ref({ total_pnl: 0, fill_count: 0 });
+    const hlPnlCurve = ref([]);
+    const pnlChartRef = ref(null);
+    const hlPage = ref(1);
+    const hlPageSize = ref(50);
+
+    const loadHLData = async () => {
+      try {
+        const [pResp, posResp, oResp, fResp, feeResp, pnlResp] = await Promise.all([
+          fetch('./api/hyperliquid/portfolio'),
+          fetch('./api/hyperliquid/positions'),
+          fetch('./api/hyperliquid/orders'),
+          fetch(`./api/hyperliquid/fills?page=${hlPage.value}&size=${hlPageSize.value}`),
+          fetch('./api/hyperliquid/fees'),
+          fetch('./api/hyperliquid/pnl_curve?days=7'),
+        ]);
+        if (pResp.ok) hlPortfolio.value = await pResp.json();
+        if (posResp.ok) hlPositions.value = await posResp.json();
+        if (oResp.ok) hlOrders.value = await oResp.json();
+        if (fResp.ok) hlFills.value = await fResp.json();
+        if (feeResp.ok) hlFees.value = await feeResp.json();
+        if (pnlResp.ok) {
+          const pnlData = await pnlResp.json();
+          hlPnlStats.value = { total_pnl: pnlData.total_pnl, fill_count: pnlData.fill_count, net_pnl: pnlData.net_pnl, total_fees: pnlData.total_fees, unrealized_pnl: pnlData.unrealized_pnl };
+          hlPnlCurve.value = pnlData.curve;
+          Vue.nextTick(() => {
+            setTimeout(() => renderPnlChart(), 150);
+          });
+        }
+      } catch(e) { console.error('HL data load error:', e); }
+    };
+
+    const hlPagePrev = () => { if (hlPage.value > 1) { hlPage.value--; loadHLData(); } };
+    const hlPageNext = () => { if (hlPage.value < hlFills.value.total_pages) { hlPage.value++; loadHLData(); } };
 
     // ── 模拟仓位加载 ──
     const loadSimPosition = async () => {
@@ -1568,6 +1784,75 @@ createApp({
     watch(() => simEquityCurve.value, () => {
       Vue.nextTick(() => {
         setTimeout(() => renderEquityChart(), 150);
+      });
+    }, { deep: true });
+
+    // ── Perps PnL Chart ──
+    const renderPnlChart = () => {
+      const container = pnlChartRef.value;
+      if (!container) return;
+      const pts = hlPnlCurve.value;
+      if (pts.length < 2) {
+        container.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#4b5563;font-size:13px">数据不足</div>`;
+        return;
+      }
+      const w = container.clientWidth || container.getBoundingClientRect().width || 600;
+      const h = 220;
+      const pad = { t: 20, r: 20, b: 30, l: 55 };
+      const chartW = w - pad.l - pad.r;
+      const chartH = h - pad.t - pad.b;
+      const vals = pts.map(p => p.cum_pnl);
+      const minV = Math.min(...vals);
+      const maxV = Math.max(...vals);
+      const range = maxV - minV || 1;
+      const yMin = minV - range * 0.1;
+      const yMax = maxV + range * 0.1;
+      const yRange = yMax - yMin;
+      const isPositive = vals[vals.length - 1] >= 0;
+
+      const scaleX = (i) => pad.l + (i / (pts.length - 1)) * chartW;
+      const scaleY = (v) => pad.t + chartH - ((v - yMin) / yRange) * chartH;
+
+      let linePath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${scaleX(i).toFixed(1)} ${scaleY(p.cum_pnl).toFixed(1)}`).join(' ');
+      const fillColor = isPositive ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)';
+      const lineColor = isPositive ? '#22c55e' : '#ef4444';
+      const areaPath = linePath + ` L ${scaleX(pts.length - 1).toFixed(1)} ${(pad.t + chartH).toFixed(1)} L ${scaleX(0).toFixed(1)} ${(pad.t + chartH).toFixed(1)} Z`;
+
+      let gridLines = '';
+      for (let i = 0; i < 5; i++) {
+        const v = yMin + (yRange / 4) * i;
+        const y = scaleY(v).toFixed(1);
+        gridLines += `<line x1="${pad.l}" y1="${y}" x2="${w - pad.r}" y2="${y}" stroke="#1f2937" stroke-width="1"/>`;
+        gridLines += `<text x="${pad.l - 5}" y="${parseFloat(y) + 4}" text-anchor="end" fill="#6b7280" font-size="10">${v.toFixed(0)}</text>`;
+      }
+
+      let xLabels = '';
+      const step = Math.max(1, Math.floor(pts.length / 7));
+      pts.forEach((p, i) => {
+        if (i % step === 0 || i === pts.length - 1) {
+          xLabels += `<text x="${scaleX(i).toFixed(1)}" y="${h - 5}" text-anchor="middle" fill="#6b7280" font-size="9">${p.date}</text>`;
+        }
+      });
+
+      let dots = pts.map((p, i) => `<circle cx="${scaleX(i).toFixed(1)}" cy="${scaleY(p.cum_pnl).toFixed(1)}" r="2.5" fill="${lineColor}" stroke="#111827" stroke-width="1"/>`).join('');
+
+      const zeroY = scaleY(0);
+      const zeroLine = (minV < 0 && maxV > 0) ? `<line x1="${pad.l}" y1="${zeroY}" x2="${w - pad.r}" y2="${zeroY}" stroke="#fbbf24" stroke-width="1" stroke-dasharray="4,4"/>` : '';
+
+      const svg = `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" style="display:block;max-width:${w}px">
+        ${gridLines}
+        ${zeroLine}
+        <path d="${areaPath}" fill="${fillColor}"/>
+        <path d="${linePath}" fill="none" stroke="${lineColor}" stroke-width="2"/>
+        ${dots}
+        ${xLabels}
+      </svg>`;
+      container.innerHTML = svg;
+    };
+
+    watch(() => hlPnlCurve.value, () => {
+      Vue.nextTick(() => {
+        setTimeout(() => renderPnlChart(), 150);
       });
     }, { deep: true });
 
@@ -1733,7 +2018,11 @@ createApp({
       if (regime === 'exhaustion') return direction === 'bullish' ? '衰竭·多' : '衰竭·空';
       if (regime === 'high_volatility') return '高波动';
       if (regime === 'low_volatility') return '低波动';
-      if (regime === 'low_vol_trend') return direction === 'bullish' ? '低波动·看涨' : '低波动·看跌';
+      if (regime === 'low_vol_trend') {
+        if (direction === 'bullish') return '低波动·看涨';
+        if (direction === 'bearish') return '低波动·看跌';
+        return '低波动·方向未定';
+      }
       return '震荡';
     };
 
@@ -1744,7 +2033,11 @@ createApp({
       if (regime === 'exhaustion') return direction === 'bullish' ? '多头衰竭' : '空头衰竭';
       if (regime === 'high_volatility') return '高波动';
       if (regime === 'low_volatility') return '低波动';
-      if (regime === 'low_vol_trend') return direction === 'bullish' ? '低波动趋势·看涨' : '低波动趋势·看跌';
+      if (regime === 'low_vol_trend') {
+        if (direction === 'bullish') return '低波动趋势·看涨';
+        if (direction === 'bearish') return '低波动趋势·看跌';
+        return '低波动趋势·方向未定';
+      }
       return '震荡';
     };
 
@@ -1768,7 +2061,7 @@ createApp({
       if (r === 'high_volatility') return `高波动预警（ATR%=${v.timeframes?.['4h']?.atr_pct?.toFixed(2) || '-'})`;
       if (r === 'low_volatility') return `低波动蓄力（ATR%=${v.timeframes?.['4h']?.atr_pct?.toFixed(2) || '-'})`;
       if (r === 'low_vol_trend') {
-        const dir = v.direction === 'bullish' ? '看涨' : '看跌';
+        const dir = v.direction === 'bullish' ? '看涨' : (v.direction === 'bearish' ? '看跌' : '方向未定');
         return `低波动${dir}趋势（ATR%=${v.timeframes?.['4h']?.atr_pct?.toFixed(2) || '-'})`;
       }
       return '震荡行情';
@@ -2138,6 +2431,7 @@ createApp({
         await loadSimPosition();
         await loadSimHistory();
         await loadSimStats();
+        await loadHLData();
       } catch(e) { console.error(e); }
       connectWs();
     });
@@ -2159,6 +2453,7 @@ createApp({
              verdictRegimeText, tfRegimeText, hRegimeText, hRegimeClass,
              dedupedHistory,
              simPosition, simHistory, simPage, simPageSize, simTotalPages, simTotal, simPagePrev, simPageNext, simPageTo, simStats, simPositionSize, simNotionalValue, simPnl, simHoldTime, simActionStateText, simCloseReasonText, histActionLabel, histActionColor, histPrice, histPositionSize, histMargin, histDetail, histStatus, simHistSize, simHistMargin, simStopDist, simStopDistColor, equityChartRef,
+             hlPortfolio, hlPositions, hlOrders, hlFills, hlFees, hlPnlStats, hlPnlCurve, pnlChartRef, hlPagePrev, hlPageNext,
              marketContextFundingRateText, marketContextFundingRateColor, marketContextOIText, marketContextCircuitBreakerWarning, marketContextConvergenceWarning, marketContextConvergenceDirection, marketContextConvergenceReason, marketContextRangingBreakout, marketContextRangingBreakoutDirection, marketContextRangingBreakoutReason, stage1Warning, stage1WarningTypeLabel, stage1WarningDirection, stage1WarningReason, stage1WarningPositionHint, stage1WarningConfidence, marketContextLeverageText, marketContextRiskText, marketContextVolAdjText, marketContextVolAdjColor, volAdjColor, tfVolPercent, tfBase, tfEff };
   }
 }).mount('#app');

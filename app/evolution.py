@@ -9,10 +9,12 @@ This module:
 import time
 import json
 import os
+import tempfile
 
 from app.database import get_connection
-from app.binance import fetch_klines
+from app.binance import fetch_klines_from_db
 from app.config import settings
+from app.indicators import calc_atr, calc_adx as calc_adx_func
 
 # Verification: how many candles AFTER the signal candle to check.
 # Differentiated by signal type: slow strategies (trending, forming) need more
@@ -116,11 +118,24 @@ def _load_evolution_params() -> dict:
 
 
 def _save_evolution_params(params: dict):
-    """Save evolution parameters to state file."""
+    """Save evolution parameters to state file atomically (write to temp + rename)."""
     params["last_updated"] = time.time()
-    os.makedirs(os.path.dirname(EVOLUTION_STATE_PATH), exist_ok=True)
-    with open(EVOLUTION_STATE_PATH, "w") as f:
-        json.dump(params, f, indent=2)
+    dir_name = os.path.dirname(EVOLUTION_STATE_PATH)
+    os.makedirs(dir_name, exist_ok=True)
+    # Atomic write: write to temp file first, then rename.
+    # Prevents corruption if the process crashes mid-write.
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".json.tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(params, f, indent=2)
+        os.replace(tmp_path, EVOLUTION_STATE_PATH)
+    except Exception:
+        # Clean up temp file on failure
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _find_signal_candle(candles: list, created_at: float):
@@ -167,6 +182,18 @@ def verify_pending_signals(conn=None):
             direction = row["direction"]
             price_at_signal = row["price_at_signal"]
             created_at = row["created_at"]
+            signal_type = row["signal_type"] if row["signal_type"] else "none"
+
+            # Skip verification for non-trading signals.
+            # signal_type='none' means this is a market state snapshot
+            # (regime observation), not an actionable trading signal.
+            # Verifying it as a directional prediction produces misleading
+            # accuracy stats — these entries exist for state tracking, not prediction.
+            if signal_type == "none":
+                conn.execute(
+                    "UPDATE signals SET verified = 1 WHERE id = ?", (sig_id,)
+                )
+                continue
 
             # Ranging/low_vol signals have direction=None — skip direction check,
             # but still evaluate regime correctness (no significant price move).
@@ -177,7 +204,7 @@ def verify_pending_signals(conn=None):
                 )
                 continue
 
-            candles = fetch_klines(settings.binance_symbol, tf, limit=200)
+            candles = fetch_klines_from_db(settings.binance_symbol, tf, limit=200)
             if not candles or len(candles) < 10:
                 continue
 
@@ -225,8 +252,6 @@ def verify_pending_signals(conn=None):
 
             # ─── Pre-compute: ATR-based dynamic thresholds ───────────────────
             # Avoids fixed-percentage bias across volatility regimes.
-            from app.indicators import calc_atr, calc_adx as calc_adx_func
-            from app.evolution import _load_evolution_params
             regime_at_signal = row["regime"]
 
             # ATR and ADX should be calculated up to the verification window,
@@ -239,9 +264,7 @@ def verify_pending_signals(conn=None):
             closes_window = [c["close"] for c in candles[:verify_limit]]
 
             # Full 200-candle data for signal-engine comparison (ADX at signal time)
-            highs_all = [c["high"] for c in candles]
-            lows_all = [c["low"] for c in candles]
-            closes_all = [c["close"] for c in candles]
+            # (kept for reference — current verification uses windowed data above)
 
             # Per-TF ADX period for verification consistency
             evol_params = _load_evolution_params()
@@ -263,6 +286,13 @@ def verify_pending_signals(conn=None):
             # Signal type: check if this is a ranging breakout signal
             is_ranging_breakout = dict(row).get("signal_type") == "ranging_breakout"
 
+            # Signal type: check if this is a trend exhaustion block signal.
+            # trend_exhaustion_block is a WARNING ("trend is too hot, don't chase"),
+            # not a directional entry. Verification should check that price did NOT
+            # continue strongly in the trend direction — stagnation or reversal
+            # confirms the warning was correct.
+            is_exhaustion_block = dict(row).get("signal_type") == "trend_exhaustion_block"
+
             # Capture full signal_type string for Stage 1 detection
             signal_type_str = dict(row).get("signal_type", "trend_following")
 
@@ -282,9 +312,31 @@ def verify_pending_signals(conn=None):
             # direction_correct only checks if price moved in the predicted direction,
             # regardless of magnitude. move_sufficient separately tracks whether
             # the move was large enough to be meaningful (ATR-based).
+            #
+            # For trend_exhaustion_block: the signal says "don't chase the trend".
+            # Direction_correct = price did NOT continue significantly in the trend
+            # direction (stagnation or reversal confirms the warning).
             if is_ranging:
                 direction_correct = 1
                 actual_direction = "neutral"
+            elif is_exhaustion_block:
+                # Exhaustion block: correct if price did NOT move significantly
+                # in the trend direction. A small retracement or sideways action
+                # means the "don't chase" warning was valid.
+                # Use 0.30×ATR as the threshold — anything below this is noise/stall.
+                tf_eb_atr_mult = {"30m": 0.15, "1h": 0.25, "4h": 0.30}
+                eb_stop_pct = max(atr_pct_price * tf_eb_atr_mult.get(tf, 0.30), tf_min_move_floor.get(tf, 0.05))
+                if direction == "bearish":
+                    # Bearish block: correct if price did NOT drop significantly
+                    # (i.e., price stayed above or rallied back)
+                    decline = (price_at_signal - current_price) / max(price_at_signal, 1) * 100
+                    direction_correct = 1 if decline <= eb_stop_pct else 0
+                    actual_direction = "stalled" if decline <= eb_stop_pct else "bearish"
+                else:
+                    # Bullish block: correct if price did NOT rally significantly
+                    rally = (current_price - price_at_signal) / max(price_at_signal, 1) * 100
+                    direction_correct = 1 if rally <= eb_stop_pct else 0
+                    actual_direction = "stalled" if rally <= eb_stop_pct else "bullish"
             else:
                 move_direction = (
                     "bullish" if current_price >= price_at_signal else "bearish"
@@ -345,52 +397,46 @@ def verify_pending_signals(conn=None):
             ranging_correct = no_trend_ranging and range_ok
 
             # 2c. Price structure validation — verify trend integrity.
-            # For exhaustion reversal or ranging breakout signals, skip price structure check:
-            # reversals often oscillate initially (V/W patterns), so strict
-            # candle-by-candle direction checks produce false failures.
-            # Ranging breakouts are short-term and noisy.
-            verify_candle_list = candles[verify_start:verify_end]
             if is_reversal_signal or is_ranging_breakout:
                 price_structure_ok = True
-            elif direction == "bearish" and len(verify_candle_list) >= 2:
+            elif direction == "bearish" and len(verify_candles) >= 2:
                 # Bearish: require closes to be mostly declining,
                 # and the last candle's close near its lower range.
                 declines = sum(
-                    1 for i in range(1, len(verify_candle_list))
-                    if verify_candle_list[i]["close"] < verify_candle_list[i - 1]["close"]
+                    1 for i in range(1, len(verify_candles))
+                    if verify_candles[i]["close"] < verify_candles[i - 1]["close"]
                 )
-                last_candle = verify_candle_list[-1]
+                last_candle = verify_candles[-1]
                 candle_range = last_candle["high"] - last_candle["low"]
                 close_near_low = (
                     (last_candle["close"] - last_candle["low"]) / max(candle_range, 1) < 0.4
                     if candle_range > 0 else True
                 )
-                price_structure_ok = (declines >= len(verify_candle_list) // 2) and close_near_low
-            elif direction == "bullish" and len(verify_candle_list) >= 2:
+                price_structure_ok = (declines >= len(verify_candles) // 2) and close_near_low
+            elif direction == "bullish" and len(verify_candles) >= 2:
                 # Bullish: require closes to be mostly rising,
                 # and the last candle's close near its upper range.
                 advances = sum(
-                    1 for i in range(1, len(verify_candle_list))
-                    if verify_candle_list[i]["close"] > verify_candle_list[i - 1]["close"]
+                    1 for i in range(1, len(verify_candles))
+                    if verify_candles[i]["close"] > verify_candles[i - 1]["close"]
                 )
-                last_candle = verify_candle_list[-1]
+                last_candle = verify_candles[-1]
                 candle_range = last_candle["high"] - last_candle["low"]
                 close_near_high = (
                     (last_candle["high"] - last_candle["close"]) / max(candle_range, 1) < 0.4
                     if candle_range > 0 else True
                 )
-                price_structure_ok = (advances >= len(verify_candle_list) // 2) and close_near_high
+                price_structure_ok = (advances >= len(verify_candles) // 2) and close_near_high
             else:
                 price_structure_ok = True  # too few candles or ranging — skip
 
             # 3. Regime correctness — decomposed into sub-metrics
-            from app.indicators import calc_adx
             # Use verification window (not full 200 candles) so ADX reflects
             # market conditions at signal time, not current rolling average.
             # Need at least 29 candles for ADX (14*2+1). If window is too small,
             # use a neutral default (25) — ADX-dependent checks will fail gracefully.
             if len(highs_window) >= 29:
-                adx_data = calc_adx(highs_window, lows_window, closes_window, period=adx_verify_period)
+                adx_data = calc_adx_func(highs_window, lows_window, closes_window, period=adx_verify_period)
                 current_adx = adx_data["adx"]
             else:
                 current_adx = 25  # neutral default
@@ -399,7 +445,18 @@ def verify_pending_signals(conn=None):
             move_sufficient = 1 if move_pct >= min_move_dynamic else 0
             structure_aligned = 1 if price_structure_ok else 0
 
-            if regime_at_signal == "trending":
+            # Exhaustion block check MUST come before regime-based checks.
+            # These signals have regime="trending" but signal_type="trend_exhaustion_block",
+            # so they would otherwise hit the regular trending branch.
+            if is_exhaustion_block:
+                # trend_exhaustion_block is a warning, not an entry signal.
+                # Correct if price did NOT continue strongly in the trend direction.
+                # I.e., either stagnated, reversed, or moved only slightly.
+                # direction_correct already means the warning was validated
+                # (price didn't move significantly in the trend direction).
+                trend_persisted = direction_correct
+                regime_correct_loose = direction_correct
+            elif regime_at_signal == "trending":
                 # Strict mode: direction correct + meaningful move.
                 # Removed structure_aligned requirement — normal trends frequently
                 # have pullback candles that break short-window structure checks,
@@ -425,8 +482,14 @@ def verify_pending_signals(conn=None):
                 trend_persisted = direction_correct and move_sufficient
                 regime_correct_loose = 1 if (direction_correct and move_sufficient) else 0
             elif regime_at_signal == "low_vol_trend":
-                trend_persisted = direction_correct and current_adx >= 25
-                regime_correct_loose = direction_correct and current_adx >= 20
+                # Low volatility trends can't rely on ADX (low by definition).
+                # Use a much lower move threshold (0.2×ATR) since low-vol trends
+                # move slowly — demanding 0.5×ATR is unrealistic for this regime.
+                tf_lvt_atr_mult = {"30m": 0.15, "1h": 0.2, "4h": 0.2}
+                lvt_move_floor = max(atr_pct_price * tf_lvt_atr_mult.get(tf, 0.2), tf_min_move_floor.get(tf, 0.05))
+                lvt_move_sufficient = 1 if move_pct >= lvt_move_floor else 0
+                trend_persisted = direction_correct and lvt_move_sufficient
+                regime_correct_loose = 1 if (direction_correct and lvt_move_sufficient) else 0
             elif regime_at_signal in ("breakout", "exhaustion"):
                 if is_reversal_signal:
                     # Reversal signals start with small moves, not large ones.
@@ -522,10 +585,10 @@ def verify_pending_signals(conn=None):
                 lt_candles = candles[signal_idx + 1:lt_end]
                 if len(lt_candles) > n_verify:
                     lt_close = lt_candles[-1]["close"]
-                    lt_move = (lt_close - price_at_signal) / max(price_at_signal, 1) * 100
-                    if direction == "bullish" and lt_close >= price_at_signal:
+                    lt_move = abs(lt_close - price_at_signal) / max(price_at_signal, 1) * 100
+                    if direction == "bullish" and lt_close >= price_at_signal and lt_move >= min_move_dynamic:
                         longer_term_valid = 1
-                    elif direction == "bearish" and lt_close <= price_at_signal:
+                    elif direction == "bearish" and lt_close <= price_at_signal and lt_move >= min_move_dynamic:
                         longer_term_valid = 1
 
             conn.execute(
@@ -632,8 +695,10 @@ def _compute_evolution_adjustments(stats: dict) -> dict:
     # Per-timeframe adjustments
     for tf in ["30m", "1h", "4h"]:
         tf_data = stats.get("timeframes", {}).get(tf, {})
-        regime_acc = tf_data.get("regime_accuracy", 50)
-        dir_acc = tf_data.get("dir_accuracy", 50)
+        # Use decay-weighted accuracy when available — it reflects recent
+        # performance and adapts faster to regime changes.
+        regime_acc = tf_data.get("regime_accuracy_decay", tf_data.get("regime_accuracy", 50))
+        dir_acc = tf_data.get("dir_accuracy_decay", tf_data.get("dir_accuracy", 50))
         verified = tf_data.get("verified", 0)
         recent = tf_data.get("recent", [])
 
@@ -785,8 +850,8 @@ def get_evolution_stats() -> dict:
     for tf in ["30m", "1h", "4h"]:
         row = conn.execute(
             "SELECT COUNT(*) as total, "
-            "COUNT(CASE WHEN verified = 1 AND unverifiable != 1 THEN 1 END) as verified, "
-            "COUNT(CASE WHEN verified = 0 THEN 1 END) as pending, "
+            "COUNT(CASE WHEN verified = 1 AND unverifiable != 1 AND signal_type != 'none' THEN 1 END) as verified, "
+            "COUNT(CASE WHEN verified = 0 AND signal_type != 'none' THEN 1 END) as pending, "
             "COUNT(CASE WHEN unverifiable = 1 THEN 1 END) as unverifiable, "
             "COUNT(CASE WHEN regime_correct = 1 THEN 1 END) as regime_correct, "
             "COUNT(CASE WHEN direction_correct = 1 THEN 1 END) as dir_correct, "
@@ -827,7 +892,7 @@ def get_evolution_stats() -> dict:
             "SUM(CASE WHEN adx >= 25 AND adx < 35 THEN 1 ELSE 0 END) as high_total, "
             "SUM(CASE WHEN adx >= 35 AND regime_correct = 1 THEN 1 ELSE 0 END) as vhigh_correct, "
             "SUM(CASE WHEN adx >= 35 THEN 1 ELSE 0 END) as vhigh_total "
-            "FROM signals WHERE timeframe = ? AND verified = 1 AND unverifiable != 1",
+            "FROM signals WHERE timeframe = ? AND verified = 1 AND unverifiable != 1 AND signal_type != 'none'",
             (tf,),
         ).fetchone()
 
@@ -893,7 +958,7 @@ def get_evolution_stats() -> dict:
             "SUM(stop_hit) as total_stop_hits, "
             "COUNT(CASE WHEN target_hit IS NOT NULL THEN 1 END) as target_checked, "
             "COUNT(CASE WHEN stop_hit IS NOT NULL THEN 1 END) as stop_checked "
-            "FROM signals WHERE timeframe = ? AND verified = 1 AND unverifiable != 1",
+            "FROM signals WHERE timeframe = ? AND verified = 1 AND unverifiable != 1 AND signal_type != 'none'",
             (tf,),
         ).fetchone()
 
@@ -907,6 +972,37 @@ def get_evolution_stats() -> dict:
         )
 
         dir_total = verified
+
+        # ─── Time-decay weighted accuracy ────────────────────────────────
+        # Older signals have less influence on threshold adjustments.
+        # Uses exponential decay: weight = 0.995^age_days
+        # Half-life ≈ 139 days (0.5 = 0.995^139).
+        # This prevents market regime changes from being drowned out by
+        # stale accuracy data from a different regime.
+        DECAY_FACTOR_PER_DAY = 0.995
+        decay_weighted_regime_correct = 0.0
+        decay_weighted_dir_correct = 0.0
+        decay_weight_total = 0.0
+        decay_rows = conn.execute(
+            "SELECT regime_correct, direction_correct, created_at "
+            "FROM signals WHERE timeframe = ? AND verified = 1 AND unverifiable != 1 AND signal_type != 'none'",
+            (tf,),
+        ).fetchall()
+        now_time = time.time()
+        for dr in decay_rows:
+            age_days = (now_time - dr["created_at"]) / 86400
+            weight = DECAY_FACTOR_PER_DAY ** age_days
+            decay_weight_total += weight
+            decay_weighted_regime_correct += weight * (dr["regime_correct"] or 0)
+            decay_weighted_dir_correct += weight * (dr["direction_correct"] or 0)
+
+        if decay_weight_total > 0:
+            regime_accuracy_decay = round(decay_weighted_regime_correct / decay_weight_total * 100, 1)
+            dir_accuracy_decay = round(decay_weighted_dir_correct / decay_weight_total * 100, 1)
+        else:
+            regime_accuracy_decay = 50.0
+            dir_accuracy_decay = 50.0
+
         timeframes[tf] = {
             "total": total,
             "verified": verified,
@@ -914,9 +1010,11 @@ def get_evolution_stats() -> dict:
             "unverifiable": unverifiable,
             "regime_correct": regime_correct,
             "regime_accuracy": round(regime_correct / max(verified, 1) * 100, 1),
+            "regime_accuracy_decay": regime_accuracy_decay,
             "dir_total": dir_total,
             "dir_correct": dir_correct,
             "dir_accuracy": round(dir_correct / max(dir_total, 1) * 100, 1),
+            "dir_accuracy_decay": dir_accuracy_decay,
             "regime_correct_loose": regime_correct_loose_count,
             "regime_accuracy_loose": round(regime_correct_loose_count / max(verified, 1) * 100, 1),
             "move_sufficient": move_sufficient_count,

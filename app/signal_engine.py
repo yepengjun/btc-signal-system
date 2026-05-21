@@ -3822,12 +3822,12 @@ def generate_verdict(
     _aggressive_leverage = None
     _funding_rate_decay = False  # set by funding rate filter if rate is in decay exemption zone
 
-    # Aggressive strategies: light position, ONLY in ranging/low_volatility regimes.
+    # Aggressive strategies: light position, ONLY in ranging/low_volatility/low_vol_trend regimes.
     # NOT during DECAYING/EXHAUSTED — trend decay overrides all entries.
     # Regime whitelist: only allow aggressive signals when market is consolidating
-    # with enough directional energy (ADX > 15). Block in high_volatility,
-    # exhaustion, forming — these regimes have too much noise or false breakouts.
-    _aggressive_regime_ok = h4["regime"] in ("ranging", "low_volatility") and h4["adx"] > 15
+    # or in early trend formation with enough directional energy (ADX > 15).
+    # Block in high_volatility, exhaustion, forming — these regimes have too much noise or false breakouts.
+    _aggressive_regime_ok = h4["regime"] in ("ranging", "low_volatility", "low_vol_trend") and h4["adx"] > 15
 
     if side == "观望" and trend_decay_level == "NONE" and _aggressive_regime_ok:
         aggressive = _check_aggressive_signals(

@@ -25,6 +25,8 @@ from app.simulated_position_manager import (
     _check_pnl_trailing_stop, _register_auto_hooks,
 )
 
+# Configure app logger to output to stdout (uvicorn doesn't configure __name__ loggers)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
@@ -286,6 +288,10 @@ async def startup():
         we query fills to find the closing trade, extract the actual fill
         price and closedPnl, and update the local DB accordingly.
         """
+        # Log on first run to confirm thread is alive
+        if not hasattr(_sync_hl_position, "_logged"):
+            logger.info("[HL sync] _sync_hl_position thread active (auto_trade=%s)", settings.auto_trade_enabled)
+            _sync_hl_position._logged = True
         if not settings.auto_trade_enabled:
             return
 
@@ -299,12 +305,18 @@ async def startup():
                 return  # no open HL position to sync
 
             pos = dict(row)
+            logger.info("[HL sync] checking position #%s (side=%s, size=%s)", pos["id"], pos.get("side"), pos.get("position_size"))
 
             # Check actual HL position state
             try:
-                hl_pos = get_router().get_position_state()
+                hl_pos, hl_err = get_router().get_position_state()
             except Exception:
+                logger.exception("[HL sync] get_position_state failed")
                 return  # HL query failed, try next cycle
+
+            if hl_err is not None:
+                logger.warning("[HL sync] HL API error: %s", hl_err)
+                return  # HL API error — don't misinterpret as "no position"
 
             if hl_pos:
                 # HL still has a position — check if size matches
@@ -316,12 +328,12 @@ async def startup():
                     # or an add/reduce failed to execute on HL.
                     # Update hl_sz and resize TP/SL to match exchange reality
                     logger.info(
-                        "[HL sync] size mismatch: local=%s hl=%s → updating hl_sz + TP/SL",
+                        "[HL sync] size mismatch: local=%s hl=%s → updating hl_sz + position_size + TP/SL",
                         local_size, hl_size,
                     )
                     conn.execute(
-                        "UPDATE positions SET hl_sz=? WHERE id=? AND hl_enabled=1",
-                        (round(hl_size, 6), pos["id"]),
+                        "UPDATE positions SET hl_sz=?, position_size=? WHERE id=? AND hl_enabled=1",
+                        (round(hl_size, 5), round(hl_size, 5), pos["id"]),
                     )
                     conn.commit()
 
@@ -331,7 +343,7 @@ async def startup():
                     sl_price = pos.get("stop")
                     tp_oid = pos.get("hl_tp_oid")
                     sl_oid = pos.get("hl_sl_oid")
-                    actual_sz = round(hl_size, 6)
+                    actual_sz = round(hl_size, 5)
 
                     if actual_sz > 0 and side:
                         router = get_router()
@@ -349,32 +361,37 @@ async def startup():
                 return
 
             # HL shows no position but local DB says open → passive close detected
-            # Query fills to find the closing trade
-            viewer = get_viewer()
-            fills_data = viewer.get_fills(page=1, size=10)
-            fills = fills_data.get("fills", [])
-            if not fills:
-                logger.warning("[HL sync] passive close detected but no fills found")
-                return
-
-            # Find the fill that closed the position. A close fill has:
-            # - side opposite to position direction (close = sell for long, buy for short)
-            # - dir contains "close" (Hyperliquid marks close fills)
+            logger.info("[HL sync] HL has no position but local #%s is open — searching for closing fill (close_side=%s)", pos["id"], "short" if pos.get("side") == "long" else "long")
             side = pos.get("side", "")
             close_side = "short" if side == "long" else "long"  # opposite of position side
+            entry_time = pos.get("created_at") or 0
 
             closing_fill = None
-            for f in fills:
-                fill_side = f.get("side", "")
-                fill_dir = f.get("dir", "")
-                # HL uses "sell" for closing long, "buy" for closing short
-                # and dir may contain "close" info
-                if fill_side == close_side:
+            viewer = get_viewer()
+            for page in range(1, 4):  # search up to 30 fills
+                fills_data = viewer.get_fills(page=page, size=10)
+                fills = fills_data.get("fills", [])
+                if not fills:
+                    break
+
+                for f in fills:
+                    fill_time = f.get("timestamp") or 0
+                    # Fill is before entry time — fills are sorted newest first
+                    if fill_time and fill_time < entry_time * 1000:
+                        break
+
+                    fill_side = f.get("side", "")
+                    if fill_side != close_side:
+                        continue
+
                     closing_fill = f
                     break
 
+                if closing_fill:
+                    break
+
             if not closing_fill:
-                logger.warning("[HL sync] no matching closing fill found")
+                logger.warning("[HL sync] no matching closing fill found (side=%s, entry_time=%s) — likely query error, skipping sync", close_side, entry_time)
                 return
 
             actual_price = closing_fill.get("price") or 0
@@ -400,16 +417,18 @@ async def startup():
                 elif side == "short" and actual_price <= target * 1.005:
                     close_reason = "take_profit"
 
-            # Use HL-reported closedPnl if available, otherwise compute from price
-            pnl_to_record = closed_pnl
-            if pnl_to_record == 0:
-                entry = pos.get("entry_price") or 0
-                btc_qty = pos.get("position_size") or 0
-                if entry > 0 and btc_qty > 0:
-                    if side == "long":
-                        pnl_to_record = btc_qty * (actual_price - entry)
-                    else:
-                        pnl_to_record = btc_qty * (entry - actual_price)
+            # Always compute PnL locally using the authoritative position size.
+            # hl_sz reflects what's actually on HL (updated by sync on mismatch),
+            # while position_size may be stale. Prefer hl_sz when available.
+            entry = pos.get("entry_price") or 0
+            btc_qty = pos.get("hl_sz") or pos.get("position_size") or 0
+            if entry > 0 and btc_qty > 0:
+                if side == "long":
+                    pnl_to_record = btc_qty * (actual_price - entry)
+                else:
+                    pnl_to_record = btc_qty * (entry - actual_price)
+            else:
+                pnl_to_record = closed_pnl  # fallback to HL-reported
 
             now = time.time()
             conn.execute(
@@ -437,9 +456,10 @@ async def startup():
                     time.sleep(15)
                     _sync_hl_position()
                 except Exception:
-                    pass
+                    logger.exception("[HL sync] background sync cycle failed")
 
         threading.Thread(target=_hl_position_sync, daemon=True).start()
+        logger.info("[HL sync] background threads started")
 
         # Background HL position reconciliation: detect simulated positions
         # that haven't been mirrored to HL yet (hl_enabled=0) and open them.
@@ -476,11 +496,40 @@ async def startup():
                             continue
 
                         router = get_router()
+
+                        # Guard: check if HL already has a position before opening.
+                        # Can happen if _extract_oid failed but market_open actually filled.
+                        try:
+                            hl_pos, hl_err = router.get_position_state()
+                            if hl_pos and hl_pos.get("size"):
+                                hl_size = abs(float(hl_pos.get("size", 0)))
+                                db_size = float(sz)
+                                # If HL already has a position of similar size, just link it
+                                if abs(hl_size - db_size) < 0.01:
+                                    logger.info(
+                                        "[HL reconcile] HL already has position (size=%s vs db=%s), linking without re-opening: id=%s",
+                                        hl_size, db_size, pid,
+                                    )
+                                    conn.execute(
+                                        "UPDATE positions SET hl_enabled=1, hl_sz=?, hl_entry_oid='reconcile_linked' "
+                                        "WHERE id=? AND hl_enabled=0",
+                                        (round(hl_size, 5), pid),
+                                    )
+                                    conn.commit()
+                                    continue
+                                else:
+                                    logger.warning(
+                                        "[HL reconcile] HL position size mismatch (hl=%s vs db=%s), may need manual review: id=%s",
+                                        hl_size, db_size, pid,
+                                    )
+                        except Exception:
+                            pass  # best-effort guard, proceed with open if check fails
+
                         logger.info(
                             "[HL reconcile] opening mirrored position: id=%s side=%s size=%s",
                             pid, side, sz,
                         )
-                        result = router.open(side, round(float(sz), 6), int(leverage), tp, sl)
+                        result = router.open(side, round(float(sz), 5), int(leverage), tp, sl)
 
                         if result.get("ok"):
                             tp_oid = result.get("tp_oid")
@@ -490,12 +539,18 @@ async def startup():
                                 f", hl_tp_oid={'?' if tp_oid else 'NULL'}, hl_sl_oid={'?' if sl_oid else 'NULL'} "
                                 "WHERE id=? AND hl_enabled=0",
                                 (
-                                    round(float(sz), 6),
+                                    round(float(sz), 5),
                                     str(result.get("order_id")),
                                     str(tp_oid) if tp_oid else None,
                                     str(sl_oid) if sl_oid else None,
                                     pid,
                                 ),
+                            )
+                            # Record action state (if not already recorded by initial open)
+                            conn.execute(
+                                "INSERT INTO position_action_state (position_id, action, price, position_size, created_at) "
+                                "VALUES (?, 'open', ?, ?, ?)",
+                                (pid, round(float(pos.get("entry_price") or 0), 1), round(float(sz), 5), time.time()),
                             )
                             conn.commit()
                             logger.info(
@@ -503,10 +558,21 @@ async def startup():
                                 pid, result.get("order_id"),
                             )
                         else:
-                            logger.warning(
-                                "[HL reconcile] open mirrored position failed: id=%s error=%s",
-                                pid, result.get("error"),
-                            )
+                            from app.auto_trader import _is_retryable_error
+                            error = result.get("error", "")
+                            if _is_retryable_error(str(error)):
+                                logger.warning(
+                                    "[HL reconcile] retryable error (will retry next cycle): id=%s error=%s",
+                                    pid, error,
+                                )
+                            else:
+                                logger.error(
+                                    "[HL reconcile] hard failure (deleting position): id=%s error=%s",
+                                    pid, error,
+                                )
+                                conn.execute("DELETE FROM positions WHERE id=?", (pid,))
+                                conn.execute("DELETE FROM position_action_state WHERE position_id=?", (pid,))
+                                conn.commit()
                 except Exception:
                     pass
 
@@ -576,7 +642,7 @@ async def startup():
                                 conn.commit()
                             elif sz and sl_order.get("sz"):
                                 order_sz = float(sl_order["sz"])
-                                expected_sz = round(float(sz), 6)
+                                expected_sz = round(float(sz), 5)
                                 if abs(order_sz - expected_sz) > 0.0001:
                                     logger.info(
                                         "[HL reconcile] SL size mismatch: order=%s expected=%s, canceling + recreating",
@@ -606,7 +672,7 @@ async def startup():
                                 conn.commit()
                             elif sz and tp_order.get("sz"):
                                 order_sz = float(tp_order["sz"])
-                                expected_sz = round(float(sz), 6)
+                                expected_sz = round(float(sz), 5)
                                 if abs(order_sz - expected_sz) > 0.0001:
                                     logger.info(
                                         "[HL reconcile] TP size mismatch: order=%s expected=%s, canceling + recreating",
@@ -622,7 +688,7 @@ async def startup():
 
                         # Recreate missing orders
                         if need_sl and sl_price and sz:
-                            result = router.set_stop_loss("", sl_price, round(float(sz), 6), side)
+                            result = router.set_stop_loss("", sl_price, round(float(sz), 5), side)
                             if result.get("ok"):
                                 conn.execute(
                                     "UPDATE positions SET hl_sl_oid=? WHERE id=?",
@@ -640,7 +706,7 @@ async def startup():
                                 )
 
                         if need_tp and tp_price and sz:
-                            result = router.set_take_profit("", tp_price, round(float(sz), 6), side)
+                            result = router.set_take_profit("", tp_price, round(float(sz), 5), side)
                             if result.get("ok"):
                                 conn.execute(
                                     "UPDATE positions SET hl_tp_oid=? WHERE id=?",
@@ -698,7 +764,7 @@ async def startup():
 
                         # Check if HL still has an open position
                         try:
-                            hl_pos = get_router().get_position_state()
+                            hl_pos, hl_err = get_router().get_position_state()
                         except Exception:
                             continue  # HL query failed, retry next cycle
 
@@ -708,7 +774,7 @@ async def startup():
                                 "[HL close reconcile] local DB closed but HL position still open: id=%s size=%s → force closing",
                                 pid, hl_pos["size"],
                             )
-                            result = get_router().close(round(float(hl_pos["size"]), 6))
+                            result = get_router().close(round(float(hl_pos["size"]), 5))
                             if result.get("ok"):
                                 fill_price = result.get("fill_price")
                                 if fill_price and fill_price > 0:
@@ -799,6 +865,16 @@ async def websocket_endpoint(ws: WebSocket):
             await asyncio.sleep(settings.signal_interval_seconds)
         except (WebSocketDisconnect, RuntimeError):
             break
+        except Exception as e:
+            logger.warning(f"WS signal generation failed: {e}")
+            # On failure, try to send cached data to keep connection alive
+            try:
+                stale = _get_cached_signals()
+                if stale:
+                    await ws.send_json(stale)
+                await asyncio.sleep(settings.signal_interval_seconds)
+            except (WebSocketDisconnect, RuntimeError):
+                break
 
 
 def require_auth(request: Request) -> Optional[str]:
@@ -1406,7 +1482,7 @@ async def api_record_action(position_id: int, request: Request):
         cum_pnl = (row.get("realized_pnl") or 0) + realized_pnl
         conn.execute(
             "UPDATE positions SET position_size=?, realized_pnl=? WHERE id=?",
-            (round(new_size, 6), round(cum_pnl, 2), position_id),
+            (round(new_size, 5), round(cum_pnl, 2), position_id),
         )
     elif action == "exit":
         conn.execute("UPDATE positions SET action_state = 'exited', status = 'closed', updated_at = ? WHERE id = ?", (now, position_id))
@@ -1460,8 +1536,7 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
 
     offset = (page - 1) * page_size
 
-    # Each open position = 1 row (open) + reduce rows. Each closed position = 2 rows (open + close) + reduce rows.
-    # Count reduce actions for pagination total
+    # Total count: open=1 row, closed=2 rows (open+close), plus reduce rows
     reduce_count = conn.execute(
         "SELECT COUNT(*) FROM position_action_state WHERE action LIKE 'reduce_%' OR action IN ('decay_reduce', 'decay_reduce_loss')"
     ).fetchone()[0]
@@ -1473,69 +1548,49 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
         WHERE is_simulated = 1 AND status = 'closed'
     """).fetchone()[0] + reduce_count
 
-    # Fetch open positions first
+    # Build all records via UNION ALL at DB level, then paginate
+    # Each record type: open, close, reduce — unified columns for display
+    all_records = []
+
+    # Open positions (1 row each)
     open_rows = conn.execute("""
-        SELECT id, side, entry_price, close_price, close_reason, entry_reason,
-               leverage, position_size, pnl, realized_pnl, created_at, closed_at,
-               reduce_count, add_count, status
+        SELECT id, side, entry_price, pnl, realized_pnl, created_at,
+               closed_at, reduce_count, add_count, status, leverage, position_size,
+               entry_reason, close_reason, close_price,
+               'open' as action_type, NULL as action_detail
         FROM positions
         WHERE is_simulated = 1 AND status = 'open'
         ORDER BY created_at DESC
     """).fetchall()
 
-    # Fetch closed positions
+    # Closed positions: open row + close row
     closed_rows = conn.execute("""
-        SELECT id, side, entry_price, close_price, close_reason, entry_reason,
-               leverage, position_size, pnl, realized_pnl, created_at, closed_at,
-               reduce_count, add_count, status
+        SELECT id, side, entry_price, pnl, realized_pnl, created_at,
+               closed_at, reduce_count, add_count, status, leverage, position_size,
+               entry_reason, close_reason, close_price,
+               'close' as action_type, close_reason as action_detail
         FROM positions
         WHERE is_simulated = 1 AND status = 'closed'
         ORDER BY closed_at DESC
     """).fetchall()
 
-    # Build rows
-    all_records = []
+    # Reduce rows from all positions
+    reduce_rows = conn.execute("""
+        SELECT position_id as id, action as action_detail, price,
+               position_size, created_at, adx_4h
+        FROM position_action_state
+        WHERE action LIKE 'reduce_%' OR action IN ('decay_reduce', 'decay_reduce_loss')
+        ORDER BY created_at DESC
+    """).fetchall()
+
+    # Build in-memory records
     for r in open_rows:
         rd = dict(r)
-        rd["action_id"] = None
         rd["action"] = "open"
         rd["action_type"] = "open"
-        rd["price"] = rd["entry_price"]
         rd["duration_hours"] = None
-        # Override position_size with original size from open action (current size may be reduced)
-        orig = conn.execute(
-            "SELECT position_size FROM position_action_state "
-            "WHERE position_id = ? AND action = 'open' LIMIT 1",
-            (rd["id"],),
-        ).fetchone()
-        if orig:
-            rd["position_size"] = orig["position_size"]
+        rd["reduce_rows"] = []
         all_records.append(rd)
-
-        # Inject reduce rows for this open position
-        if rd["reduce_count"] and rd["reduce_count"] > 0:
-            reduces = conn.execute(
-                "SELECT action, price, position_size, created_at, adx_4h "
-                "FROM position_action_state WHERE position_id = ? "
-                "AND (action LIKE 'reduce_%' OR action IN ('decay_reduce', 'decay_reduce_loss')) "
-                "ORDER BY created_at",
-                (rd["id"],),
-            ).fetchall()
-            entry = rd["entry_price"]
-            side = rd["side"]
-            for red in reduces:
-                reduced_amt = red["position_size"]
-                pnl = round((red["price"] - entry) * reduced_amt if side == "long" else (entry - red["price"]) * reduced_amt, 2)
-                red_rec = dict(rd)
-                red_rec["action"] = red["action"]
-                red_rec["action_type"] = "reduce"
-                red_rec["price"] = red["price"]
-                red_rec["created_at"] = red["created_at"]
-                red_rec["position_size"] = reduced_amt
-                red_rec["pnl"] = pnl
-                red_rec["action_id"] = None
-                red_rec["duration_hours"] = None
-                all_records.append(red_rec)
 
     for r in closed_rows:
         rd = dict(r)
@@ -1545,50 +1600,66 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
         open_rec = dict(rd)
         open_rec["action"] = "open"
         open_rec["action_type"] = "open"
-        open_rec["price"] = open_rec["entry_price"]
+        open_rec["price"] = rd["entry_price"]
         all_records.append(open_rec)
-
-        # Inject reduce rows for this closed position
-        if rd["reduce_count"] and rd["reduce_count"] > 0:
-            reduces = conn.execute(
-                "SELECT action, price, position_size, created_at, adx_4h "
-                "FROM position_action_state WHERE position_id = ? "
-                "AND (action LIKE 'reduce_%' OR action IN ('decay_reduce', 'decay_reduce_loss')) "
-                "ORDER BY created_at",
-                (rd["id"],),
-            ).fetchall()
-            entry = rd["entry_price"]
-            side = rd["side"]
-            for red in reduces:
-                reduced_amt = red["position_size"]
-                pnl = round((red["price"] - entry) * reduced_amt if side == "long" else (entry - red["price"]) * reduced_amt, 2)
-                red_rec = dict(rd)
-                red_rec["action"] = red["action"]
-                red_rec["action_type"] = "reduce"
-                red_rec["price"] = red["price"]
-                red_rec["created_at"] = red["created_at"]
-                red_rec["position_size"] = reduced_amt
-                red_rec["pnl"] = pnl
-                red_rec["action_id"] = None
-                red_rec["duration_hours"] = None
-                all_records.append(red_rec)
 
         # Close row
         close_rec = dict(rd)
         close_rec["action"] = "close"
         close_rec["action_type"] = "close"
-        close_rec["price"] = close_rec.get("close_price") or close_rec["entry_price"]
-        close_rec["created_at"] = close_rec["closed_at"]  # show close time in UI
+        close_rec["price"] = rd["close_price"]
+        close_rec["created_at"] = rd["closed_at"]
         all_records.append(close_rec)
 
-    # Sort ALL records by display time descending
+    # Pre-fetch all reduce rows by position_id (single query instead of N+1)
+    reduce_by_pos = {}
+    for rr in reduce_rows:
+        pid = rr["id"]
+        reduce_by_pos.setdefault(pid, []).append(dict(rr))
+
+    # Inject reduce rows into their parent positions
     for rec in all_records:
-        rec["_sort_time"] = rec.get("created_at") or rec.get("closed_at") or 0
-    all_records.sort(key=lambda r: r["_sort_time"], reverse=True)
+        pid = rec["id"]
+        if pid in reduce_by_pos:
+            rec["reduce_rows"] = reduce_by_pos[pid]
+
+    # Expand reduce rows into the flat list for display
+    expanded = []
+    for rec in all_records:
+        expanded.append(rec)
+        for red in rec.get("reduce_rows", []):
+            entry = rec["entry_price"]
+            side = rec["side"]
+            reduced_amt = red["position_size"]
+            pnl = round((red["price"] - entry) * reduced_amt if side == "long" else (entry - red["price"]) * reduced_amt, 2)
+            expanded.append({
+                "id": rec["id"],
+                "side": rec["side"],
+                "price": red["price"],
+                "pnl": pnl,
+                "realized_pnl": rec.get("realized_pnl", 0),
+                "created_at": red["created_at"],
+                "closed_at": rec.get("closed_at"),
+                "status": rec["status"],
+                "leverage": rec["leverage"],
+                "position_size": reduced_amt,
+                "entry_reason": rec.get("entry_reason"),
+                "close_reason": rec.get("close_reason"),
+                "close_price": rec.get("close_price"),
+                "action": red["action_detail"],
+                "action_type": "reduce",
+                "duration_hours": None,
+            })
+
+    # Sort by display time descending
+    expanded.sort(key=lambda r: r.get("created_at") or 0, reverse=True)
 
     # Apply pagination
-    total_pages = (total + page_size - 1) // page_size if page_size > 0 else 0
-    records = all_records[offset:offset + page_size]
+    records = expanded[offset:offset + page_size]
+
+    # Clean up internal reduce_rows before returning
+    for rec in records:
+        rec.pop("reduce_rows", None)
 
     conn.close()
 
@@ -1597,7 +1668,7 @@ async def api_simulated_position_history(request: Request, page: int = 1, page_s
         "total": total,
         "page": page,
         "page_size": page_size,
-        "total_pages": (total + page_size - 1) // page_size if page_size > 0 else 0,
+        "total_pages": max(1, (total + page_size - 1) // page_size),
     }
 
 
@@ -1620,7 +1691,17 @@ async def api_simulated_position_stats(request: Request):
         "SELECT COALESCE(SUM(realized_pnl), 0) as open_realized_pnl "
         "FROM positions WHERE is_simulated = 1 AND status = 'open'"
     ).fetchone()
-    realized_pnl = closed_pnl + (row["open_realized_pnl"] or 0)
+    sim_realized_pnl = closed_pnl + (row["open_realized_pnl"] or 0)
+
+    # When HL backend is active, use actual HL realized PnL from fills
+    if settings.trade_backend == "hyperliquid" and settings.auto_trade_enabled:
+        try:
+            hl_realized_pnl = get_router().get_realized_pnl()
+            realized_pnl = hl_realized_pnl
+        except Exception:
+            realized_pnl = sim_realized_pnl
+    else:
+        realized_pnl = sim_realized_pnl
 
     # Today's PnL: closed positions since start of today (UTC+8) + realized PnL from open positions
     import time as _time
@@ -1643,9 +1724,19 @@ async def api_simulated_position_stats(request: Request):
     ).fetchone()
     today_pnl += (row["open_realized_pnl"] or 0)
 
-    # Current balance = initial + realized PnL
+    # Current balance = HL account value (if HL active) or initial + realized PnL
     initial_balance = settings.sim_initial_balance
-    current_balance = initial_balance + realized_pnl
+    if settings.trade_backend == "hyperliquid" and settings.auto_trade_enabled:
+        try:
+            hl_value = get_router().get_account_value()
+            if hl_value and hl_value > 0:
+                current_balance = hl_value
+            else:
+                current_balance = initial_balance + realized_pnl
+        except Exception:
+            current_balance = initial_balance + realized_pnl
+    else:
+        current_balance = initial_balance + realized_pnl
 
     # Open position margin (notional / leverage)
     open_pos = conn.execute(
@@ -1799,40 +1890,124 @@ async def api_hl_net_curve(request: Request, period: str = "7d"):
         return JSONResponse({"detail": str(e)}, status_code=500)
 
 
-@app.get("/api/hyperliquid/pnl_curve")
-async def api_hl_pnl_curve(request: Request, days: int = 7):
-    """Perps PnL curve: cumulative closed PnL from fills over the last N days.
+@app.get("/api/hyperliquid/order_history")
+async def api_hl_order_history(request: Request, page: int = 1, size: int = 10):
+    """Order history: fills aggregated by order ID (oid).
 
-    Returns:
-      - curve: cumulative PnL from close fills
-      - total_pnl: realized PnL (sum of closed_pnl from all fills)
-      - total_fees: all trading fees paid
-      - unrealized_pnl: current open position PnL
-      - net_pnl: total_pnl + total_fees + unrealized_pnl (actual account change)
-      - fill_count: number of fills with non-zero closed_pnl
+    Data is served from local hl_fills cache (incrementally synced from HL API).
+    Returns paginated list of orders + per-order fills for detail view.
     """
     if not require_auth(request):
         return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
     try:
         viewer = get_viewer()
-        fills_data = viewer.get_fills(page=1, size=10000, coin="BTC")
-        all_fills = fills_data.get("fills", [])
+        conn = get_connection()
 
-        # Filter by time window for curve
-        cutoff_ms = (time.time() - days * 86400) * 1000
-        recent = [f for f in all_fills if f.get("timestamp", 0) >= cutoff_ms]
-        recent.sort(key=lambda f: f.get("timestamp", 0))
+        # Sync new fills from HL API (incremental, fast if nothing new)
+        from app.hyperliquid_viewer import sync_fills_to_db
+        sync_fills_to_db(conn, viewer, coin="BTC")
+
+        # Aggregate fills by oid from local DB
+        rows = conn.execute("""
+            SELECT oid, side, dir,
+                   SUM(size) as total_size,
+                   SUM(price * size) / SUM(size) as avg_price,
+                   SUM(closed_pnl) as total_pnl,
+                   SUM(ABS(fee)) as total_fee,
+                   COUNT(*) as fill_count,
+                   MIN(timestamp_ms) as first_fill_time,
+                   MAX(timestamp_ms) as last_fill_time
+            FROM hl_fills
+            WHERE coin = 'BTC'
+            GROUP BY oid
+            ORDER BY MAX(timestamp_ms) DESC
+        """).fetchall()
+
+        orders = []
+        for r in rows:
+            first_fill = datetime.fromtimestamp(r["first_fill_time"] / 1000).strftime("%m-%d %H:%M")
+            last_fill = datetime.fromtimestamp(r["last_fill_time"] / 1000).strftime("%m-%d %H:%M")
+            orders.append({
+                "oid": r["oid"],
+                "dir": r["dir"] or "",
+                "side": r["side"],
+                "fill_count": r["fill_count"],
+                "total_size": round(r["total_size"], 5),
+                "avg_price": round(r["avg_price"], 1),
+                "total_pnl": round(r["total_pnl"], 2),
+                "total_fee": round(r["total_fee"], 4),
+                "first_fill_time": r["first_fill_time"],
+                "last_fill_time": r["last_fill_time"],
+                "first_fill_date": first_fill,
+                "last_fill_date": last_fill,
+            })
+
+        total = len(orders)
+        start = (page - 1) * size
+        end = start + size
+        page_orders = orders[start:end]
+
+        conn.close()
+
+        return {
+            "orders": page_orders,
+            "total": total,
+            "page": page,
+            "total_pages": max(1, (total + size - 1) // size),
+        }
+    except Exception as e:
+        _logger.exception("HL order_history failed")
+        return JSONResponse({"detail": str(e)}, status_code=500)
+
+
+@app.get("/api/hyperliquid/pnl_curve")
+async def api_hl_pnl_curve(request: Request, days: int = 0):
+    """Perps PnL curve: cumulative closed PnL from fills over the last N days.
+
+    Data is served from local hl_fills cache.
+    days=0 means all available fills (no time filter).
+    """
+    if not require_auth(request):
+        return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
+    try:
+        viewer = get_viewer()
+        conn = get_connection()
+
+        # Sync new fills from HL API
+        from app.hyperliquid_viewer import sync_fills_to_db
+        sync_fills_to_db(conn, viewer, coin="BTC")
+
+        if days > 0:
+            cutoff_ms = (time.time() - days * 86400) * 1000
+            rows = conn.execute(
+                "SELECT tid, oid, side, closed_pnl, ABS(fee) as fee, timestamp_ms "
+                "FROM hl_fills WHERE coin = 'BTC' AND timestamp_ms >= ? "
+                "ORDER BY timestamp_ms ASC",
+                (cutoff_ms,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT tid, oid, side, closed_pnl, ABS(fee) as fee, timestamp_ms "
+                "FROM hl_fills WHERE coin = 'BTC' "
+                "ORDER BY timestamp_ms ASC"
+            ).fetchall()
 
         # Build cumulative PnL curve
         cum_pnl = 0
+        total_pnl = 0
+        total_fees = 0
         curve = []
-        for f in recent:
-            pnl = f.get("closed_pnl", 0)
+        fill_count = 0
+        for r in rows:
+            pnl = r["closed_pnl"]
+            fee = r["fee"]
+            total_pnl += pnl
+            total_fees += fee
             if pnl != 0:
                 cum_pnl += pnl
-                ts = f["timestamp"]
-                dt = datetime.fromtimestamp(ts / 1000).strftime("%m-%d %H:%M")
-                curve.append({"timestamp": ts, "date": dt, "cum_pnl": round(cum_pnl, 2)})
+                fill_count += 1
+                dt = datetime.fromtimestamp(r["timestamp_ms"] / 1000).strftime("%m-%d %H:%M")
+                curve.append({"timestamp": r["timestamp_ms"], "date": dt, "cum_pnl": round(cum_pnl, 2)})
 
         # Ensure at least one point (start at 0)
         if curve and (curve[0]["cum_pnl"] != 0 or len(curve) > 1):
@@ -1844,17 +2019,14 @@ async def api_hl_pnl_curve(request: Request, days: int = 7):
             now_dt = datetime.fromtimestamp(now_ts / 1000).strftime("%m-%d %H:%M")
             curve = [{"timestamp": now_ts, "date": now_dt, "cum_pnl": 0}]
 
-        # Total realized PnL from ALL fills (not just recent window)
-        total_pnl = sum(f.get("closed_pnl", 0) for f in all_fills)
-        # Total fees from all fills
-        total_fees = sum(-abs(float(f.get("fee", 0))) for f in all_fills)
-
         # Current unrealized PnL
         positions = viewer.get_positions()
         unrealized_pnl = sum(p.get("unrealized_pnl", 0) for p in positions if "error" not in p)
 
-        # Net PnL = realized + fees + unrealized
-        net_pnl = total_pnl + total_fees + unrealized_pnl
+        # Net PnL = realized - fees + unrealized
+        net_pnl = total_pnl - total_fees + unrealized_pnl
+
+        conn.close()
 
         return {
             "curve": curve,
@@ -1862,10 +2034,28 @@ async def api_hl_pnl_curve(request: Request, days: int = 7):
             "total_fees": round(total_fees, 2),
             "unrealized_pnl": round(unrealized_pnl, 2),
             "net_pnl": round(net_pnl, 2),
-            "fill_count": len([f for f in recent if f.get("closed_pnl", 0) != 0]),
+            "fill_count": fill_count,
         }
     except Exception as e:
         _logger.exception("HL pnl_curve failed")
+        return JSONResponse({"detail": str(e)}, status_code=500)
+
+
+@app.get("/api/position/{position_id}/hl_orders")
+async def api_position_hl_orders(position_id: int, request: Request):
+    """Get all HL orders mapped to a local position (open/add/close/reduce/tp/sl)."""
+    if not require_auth(request):
+        return JSONResponse({"detail": "未登录或登录已失效"}, status_code=401)
+    try:
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT * FROM hl_order_mapping WHERE position_id = ? ORDER BY created_at",
+            (position_id,),
+        ).fetchall()
+        orders = [dict(r) for r in rows]
+        conn.close()
+        return {"position_id": position_id, "orders": orders, "total": len(orders)}
+    except Exception as e:
         return JSONResponse({"detail": str(e)}, status_code=500)
 
 

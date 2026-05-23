@@ -48,6 +48,7 @@ import logging
 from app.config import settings
 from app.trade_executor import get_router
 from app.evolution import get_active_thresholds
+from app.database import record_hl_order
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,7 @@ REOPEN_COOLDOWN_SECONDS = max(settings.signal_interval_seconds, 300)  # min 5 mi
 OPPOSITE_DIRECTION_COOLDOWN = 2 * REOPEN_COOLDOWN_SECONDS  # extra cooldown for opposite direction
 MAX_REDUCE_COUNT = 2
 MAX_ADD_COUNT = 3  # max pyramid adds
+MAX_DECAY_TIGHTEN_COUNT = 2  # max stop tightenings from DECAYING before freeze
 
 
 def calculate_pnl(position: dict, close_price: float) -> float:
@@ -119,12 +121,15 @@ def close_simulated_position(conn, position: dict, close_price: float, reason: s
         btc_size = position.get("position_size") or position.get("hl_sz") or 0
         if btc_size > 0:
             try:
-                result = router.close(round(btc_size, 6))
+                result = router.close(round(btc_size, 5))
                 if result.get("ok"):
                     hl_closed = True
                     hl_fill_price = result.get("fill_price")
                     hl_order_id = result.get("order_id")
                     logger.info("HL close confirmed: oid=%s fill=%s", hl_order_id, hl_fill_price)
+                    # Record HL order mapping for audit trail
+                    record_hl_order(position["id"], hl_order_id, "close",
+                                    size=round(btc_size, 5), price=hl_fill_price)
                 elif "No position" in str(result.get("error", "")):
                     # HL has no position — already closed passively (TP/SL fill)
                     hl_closed = True
@@ -427,17 +432,25 @@ def _check_trend_exhaustion(conn, sim_pos: dict, verdict: dict, current_price: f
         # Trend weakening but not yet exhausted — tighten stop toward entry.
         # Move stop to halfway between current_stop and entry (locks 50% of
         # the distance to entry), but only in favorable direction.
+        # Max 3 tightenings — after that the stop freezes to prevent
+        # infinite convergence to entry price.
+        tighten_count = sim_pos.get("decay_tighten_count") or 0
+        if tighten_count >= MAX_DECAY_TIGHTEN_COUNT:
+            return False  # max tighten reached, stop frozen
+
         current_stop = sim_pos.get("stop")
         if entry > 0 and current_stop is not None:
             if pos_side == "long":
                 new_stop = round(entry + (current_stop - entry) * 0.5, 1)
                 if new_stop > current_stop:
                     conn.execute(
-                        "UPDATE positions SET stop=?, stop_update_reason=? WHERE id=?",
-                        (new_stop, "trend_decay_tightened", sim_pos["id"]),
+                        "UPDATE positions SET stop=?, stop_update_reason=?, decay_tighten_count=? WHERE id=?",
+                        (new_stop, "trend_decay_tightened", tighten_count + 1, sim_pos["id"]),
                     )
                     conn.commit()
+                    logger.info(f"[DECAYING] stop tightened to {new_stop} (count={tighten_count + 1})")
                     # Sync to Hyperliquid if auto-trading enabled
+                    logger.info(f"[DECAYING] firing {len(_auto_stop_update_hooks)} stop_update hooks")
                     for hook in _auto_stop_update_hooks:
                         try:
                             hook(conn, sim_pos, new_stop)
@@ -448,11 +461,13 @@ def _check_trend_exhaustion(conn, sim_pos: dict, verdict: dict, current_price: f
                 new_stop = round(entry - (entry - current_stop) * 0.5, 1)
                 if new_stop < current_stop:
                     conn.execute(
-                        "UPDATE positions SET stop=?, stop_update_reason=? WHERE id=?",
-                        (new_stop, "trend_decay_tightened", sim_pos["id"]),
+                        "UPDATE positions SET stop=?, stop_update_reason=?, decay_tighten_count=? WHERE id=?",
+                        (new_stop, "trend_decay_tightened", tighten_count + 1, sim_pos["id"]),
                     )
                     conn.commit()
+                    logger.info(f"[DECAYING] stop tightened to {new_stop} (count={tighten_count + 1})")
                     # Sync to Hyperliquid if auto-trading enabled
+                    logger.info(f"[DECAYING] firing {len(_auto_stop_update_hooks)} stop_update hooks")
                     for hook in _auto_stop_update_hooks:
                         try:
                             hook(conn, sim_pos, new_stop)
@@ -580,7 +595,7 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
         if settings.trade_backend == "hyperliquid" and settings.auto_trade_enabled:
             try:
                 router = get_router()
-                hl_result = router.reduce(round(reduce_size, 6))
+                hl_result = router.reduce(round(reduce_size, 5))
                 if hl_result.get("ok"):
                     logger.info("HL reduce confirmed: oid=%s fill=%s",
                                 hl_result.get("order_id"), hl_result.get("fill_price"))
@@ -609,7 +624,7 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
             (
                 new_action_state,
                 new_reduce_count, now,
-                round(new_size, 6),
+                round(new_size, 5),
                 round(cum_pnl, 2),
                 sim_pos["id"],
             ),
@@ -620,7 +635,7 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
         conn.execute(
             "INSERT INTO position_action_state (position_id, action, adx_4h, price, position_size, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (sim_pos["id"], f"reduce_{new_reduce_count}", adx_4h, round(current_price, 1), round(reduce_size, 6), now),
+            (sim_pos["id"], f"reduce_{new_reduce_count}", adx_4h, round(current_price, 1), round(reduce_size, 5), now),
         )
         conn.commit()
 
@@ -662,7 +677,7 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
             try:
                 router = get_router()
                 side = sim_pos.get("side", "long")
-                hl_result = router.add(side, round(add_btc, 6), leverage)
+                hl_result = router.add(side, round(add_btc, 5), leverage)
                 if hl_result.get("ok"):
                     logger.info("HL add confirmed: oid=%s fill=%s",
                                 hl_result.get("order_id"), hl_result.get("fill_price"))
@@ -705,7 +720,7 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
                 max(sim_pos.get("max_adx") or 0, adx_4h or 0),
                 now,
                 new_add_count,
-                round(new_total_size, 6),
+                round(new_total_size, 5),
                 round(new_entry_price, 1),
                 new_stop,
                 sim_pos["id"],
@@ -718,7 +733,7 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
         conn.execute(
             "INSERT INTO position_action_state (position_id, action, adx_4h, price, position_size, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (position_id, new_action_state, adx_4h, round(add_price, 1), round(add_btc, 6), now),
+            (position_id, new_action_state, adx_4h, round(add_price, 1), round(add_btc, 5), now),
         )
         conn.commit()
 
@@ -764,10 +779,25 @@ def _manage_open_position(conn, sim_pos: dict, verdict: dict, current_price: flo
 
 
 def _get_available_balance(conn) -> float:
-    """Calculate available balance: initial + closed PnL - all open position margins.
+    """Calculate available balance.
 
-    Accounts for ALL positions (manual + simulated) since they share one account.
+    When HL backend is active: MUST use real HL accountValue. If HL balance
+    query fails, return 0 to prevent opening positions with stale data.
+
+    Otherwise: simulated balance = initial + closed PnL - open position margins.
     """
+    if settings.trade_backend == "hyperliquid" and settings.auto_trade_enabled:
+        try:
+            hl_value = get_router().get_account_value()
+            if hl_value and hl_value > 0:
+                return hl_value
+            # HL query succeeded but returned 0 or None — account has no funds
+            logger.warning("[available_balance] HL returned accountValue=%s — blocking open", hl_value)
+            return 0.0
+        except Exception as e:
+            logger.error("[available_balance] HL query failed — blocking open: %s", e)
+            return 0.0
+
     row = conn.execute(
         "SELECT COALESCE(SUM(pnl), 0) as closed_pnl FROM positions "
         "WHERE status='closed'"
@@ -810,13 +840,19 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
     side = "long" if order_side == "做多" else "short"
     regime = verdict.get("regime", "")
 
-    # Block opening on established trends (3+ consecutive trending cycles).
+    # Block opening on established trends (3+ consecutive trending cycles)
+    # ONLY when there's already an open simulated position (avoid adding to stale positions).
+    # If no position exists and signal says actionable, allow entry.
     trend_fresh = verdict.get("market_context", {}).get("trend_fresh", True)
     adx_4h = verdict.get("timeframes", {}).get("4h", {}).get("adx", 0)
     established_trend = not trend_fresh and adx_4h >= 40
     if not trend_fresh and not established_trend:
-        logger.debug(f"[auto_open] blocked: not fresh trend (fresh={trend_fresh}, adx_4h={adx_4h}, side={order_side})")
-        return
+        has_open = conn.execute(
+            "SELECT 1 FROM positions WHERE is_simulated=1 AND status='open' LIMIT 1"
+        ).fetchone()
+        if has_open:
+            logger.debug(f"[auto_open] blocked: not fresh trend with open position (fresh={trend_fresh}, adx_4h={adx_4h})")
+            return
 
     # Block opening on low-conviction signal types.
     signal_type = verdict.get("timeframes", {}).get("4h", {}).get("signal_type") or ""
@@ -866,30 +902,49 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
             logger.debug(f"[auto_open] blocked: cooldown (elapsed={elapsed:.0f}s < cooldown={cooldown:.0f}s, side={order_side}, last_side={last_close_side})")
             return
 
-    # Price improvement check: same-direction re-entry must be at a better price.
-    # Long: buy lower than last long entry. Short: sell higher than last short entry.
-    # Prevents chasing — each re-entry must offer a better entry point.
-    # EXCEPTION: if last same-direction trade was profitable, direction was correct,
-    # allow a small pullback tolerance (0.5%) — don't miss secondary trends.
+    # Price chase guard: same-direction re-entry after a profitable trade.
+    # Instead of a fixed 0.5% threshold (which ignores signal quality), we
+    # check if the signal's RR is acceptable. If RR >= minimum, the signal
+    # engine has already validated this entry point — no need to block.
+    # This avoids "signal says go, chase guard says no" conflicts.
     last_same_dir = conn.execute(
-        "SELECT entry_price, pnl FROM positions WHERE is_simulated=1 AND status='closed' "
+        "SELECT entry_price, pnl, signal_type FROM positions WHERE is_simulated=1 AND status='closed' "
         "AND side = ? ORDER BY closed_at DESC LIMIT 1",
         (side,),
     ).fetchone()
     if last_same_dir and last_same_dir["entry_price"]:
-        last_entry = last_same_dir["entry_price"]
-        last_pnl = last_same_dir["pnl"] or 0
+        last_same = dict(last_same_dir)
+        last_signal_type = last_same.get("signal_type") or "none"
+        if last_signal_type == signal_type:
+            last_entry = last_same["entry_price"]
+            last_pnl = last_same["pnl"] or 0
 
-        if side == "long":
-            threshold = last_entry * 1.005 if last_pnl > 0 else last_entry
-            if current_price >= threshold:
-                logger.debug(f"[auto_open] blocked: price chase long (current={current_price} >= threshold={threshold:.1f}, last_pnl={last_pnl:.2f})")
-                return
-        if side == "short":
-            threshold = last_entry * 0.995 if last_pnl > 0 else last_entry
-            if current_price <= threshold:
-                logger.debug(f"[auto_open] blocked: price chase short (current={current_price} <= threshold={threshold:.1f}, last_pnl={last_pnl:.2f})")
-                return
+            # Only block if signal RR hasn't been validated yet.
+            # Check RR here — if target/stop exist and RR is acceptable,
+            # allow entry regardless of price vs last_entry relationship.
+            target_check = order.get("target")
+            stop_check = order.get("stop")
+            entry_ref = order.get("entry_price") or current_price
+            rr_ok = False
+            if target_check and stop_check:
+                risk = abs(entry_ref - stop_check)
+                reward = abs(target_check - entry_ref)
+                if risk > 0:
+                    rr_min = 1.5  # trend_following/trend_pullback floor
+                    rr_ok = (reward / risk) >= rr_min
+
+            if not rr_ok:
+                # RR not validated or too low — apply conservative price guard
+                if side == "long":
+                    threshold = last_entry if last_pnl <= 0 else last_entry * 1.005
+                    if current_price >= threshold:
+                        logger.warning(f"[auto_open] blocked: price chase long (current={current_price} >= threshold={threshold:.1f}, last_pnl={last_pnl:.2f})")
+                        return
+                if side == "short":
+                    threshold = last_entry if last_pnl <= 0 else last_entry * 0.995
+                    if current_price <= threshold:
+                        logger.warning(f"[auto_open] blocked: price chase short (current={current_price} <= threshold={threshold:.1f}, last_pnl={last_pnl:.2f})")
+                        return
 
     # Block opening when market context shows trend exhaustion
     # Exception: trend relay (4h exhaustion + 1h/30m same-direction forming)
@@ -955,25 +1010,38 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
     signal_type = verdict.get("timeframes", {}).get("4h", {}).get("signal_type") or ""
 
     # Verify risk:reward ratio — dynamic by signal type.
-    # Trend-following signals (trend_following, trend_pullback, low_vol_trend)
-    # and high-conviction reversal/confirmation signals use evolution rr_ratio (default 1.5).
-    # All other signals (stage1/macro/ranging) use 1.0 floor.
+    # Tier 1.5: trend_following / trend_pullback (evolution rr_ratio).
+    # Tier 1.2: low_vol_trend / exhaustion_reversal.
+    # Tier 0.6: trend_forming_early (wide stop, light entry).
+    # Tier 1.0: all other signals (stage1 / macro / ranging).
     if target and stop:
         entry = order.get("entry_price") or current_price
         risk = abs(entry - stop)
         reward = abs(target - entry)
         evol = get_active_thresholds()
 
-        # Use signal_type for RR classification — more reliable than string parsing
+        # Four-tier RR floor by signal type:
+        #   1.5 — trend_following / trend_pullback (evolution rr_ratio)
+        #   1.2 — low_vol_trend / exhaustion_reversal (moderate RR)
+        #   1.0 — all other signals (macro / ranging)
+        #   0.6 — trend_forming_early (wide ATR stop, light entry)
+        #   0.55 — stage1_* (early warning, light position)
         signal_type = verdict.get("timeframes", {}).get("4h", {}).get("signal_type") or ""
-        is_trend_following = signal_type in (
-            "trend_following", "trend_pullback", "low_vol_trend",
-            "exhaustion_reversal",  # reversal signals require good RR too
-        )
-        rr_min = evol.get("rr_ratio", 1.5) if is_trend_following else 1.0
+        if signal_type in ("trend_following", "trend_pullback"):
+            rr_min = evol.get("rr_ratio", 1.5)
+        elif signal_type in ("low_vol_trend", "exhaustion_reversal"):
+            rr_min = 1.2
+        elif signal_type == "trend_forming_early":
+            rr_min = 0.6
+        elif signal_type.startswith("stage1_"):
+            rr_min = 0.55
+        elif signal_type.startswith("aggressive_"):
+            rr_min = 0.6
+        else:
+            rr_min = 1.0
 
         if risk > 0 and reward / risk < rr_min:
-            logger.debug(f"[auto_open] blocked: RR too low (rr={reward/risk:.2f} < min={rr_min}, side={order_side})")
+            logger.warning(f"[auto_open] blocked: RR too low (rr={reward/risk:.2f} < min={rr_min}, side={order_side}, signal_type={signal_type})")
             return  # RR too low, skip
 
     strength = verdict.get("strength", "")
@@ -1048,7 +1116,7 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
             entry_adx,
             entry_adx,
             entry_reason,
-            round(position_btc, 6),
+            round(position_btc, 5),
             signal_type or None,
             round(current_price, 1),  # max_price = entry_price at open
             round(current_price, 1),  # min_price = entry_price at open
@@ -1060,7 +1128,7 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
     # the position record to prevent simulated/real desync.
     new_pos = {
         "id": position_id, "side": side, "entry_price": round(current_price, 1),
-        "position_size": round(position_btc, 6), "leverage": leverage,
+        "position_size": round(position_btc, 5), "leverage": leverage,
         "target": round(target, 1) if target else None,
         "stop": round(stop, 1) if stop else None,
         "signal_type": signal_type or None,
@@ -1071,25 +1139,43 @@ def _try_auto_open(conn, verdict: dict, current_price: float, now: float):
         except Exception:
             pass  # hook failure must not break position management
 
-    # Check if HL open succeeded: if hl_entry_oid is still None and HL is
-    # configured, the open call failed. Delete the position record to keep
-    # simulated and real execution in sync.
+    # Check if HL open succeeded: hl_enabled=1 means the market entry went through.
+    # When HL backend is active, _hl_mirror_open already handled failure decisions
+    # (hard failure → deleted, retryable → kept for reconcile), so skip rollback.
     if settings.trade_backend == "hyperliquid" and settings.auto_trade_enabled:
+        # _hl_mirror_open may have deleted the position (hard failure) — check
         hl_row = conn.execute(
-            "SELECT hl_entry_oid FROM positions WHERE id=?", (position_id,)
+            "SELECT id FROM positions WHERE id=?", (position_id,)
         ).fetchone()
-        if not hl_row or not hl_row["hl_entry_oid"] or hl_row["hl_entry_oid"] == "None":
+        if not hl_row:
+            return  # hard failure: position was deleted by _hl_mirror_open
+        # retryable failure: position exists with hl_enabled=0, reconcile will retry
+    else:
+        hl_row = conn.execute(
+            "SELECT hl_enabled, hl_entry_oid FROM positions WHERE id=?", (position_id,)
+        ).fetchone()
+        if not hl_row or not hl_row["hl_enabled"]:
             conn.execute("DELETE FROM positions WHERE id=?", (position_id,))
             conn.execute("DELETE FROM position_action_state WHERE position_id=?", (position_id,))
             conn.commit()
-            logger.warning("[auto_open] HL open failed (or hl_entry_oid missing), rolled back position id=%s", position_id)
+            logger.warning("[auto_open] HL entry call failed, rolled back position id=%s", position_id)
             return  # Skip simulated position creation entirely
 
-    # Record action state and commit (only after HL open succeeded)
+    # Record action state and commit (only after HL open succeeded).
+    # For retryable HL failures, skip action_state until the open actually succeeds.
+    if settings.trade_backend == "hyperliquid" and settings.auto_trade_enabled:
+        hl_check = conn.execute(
+            "SELECT hl_enabled FROM positions WHERE id=?", (position_id,)
+        ).fetchone()
+        if not hl_check or not hl_check["hl_enabled"]:
+            return  # open not yet confirmed on HL — action_state will be recorded by reconcile
+    else:
+        pass  # simulated mode: always record
+
     conn.execute(
         "INSERT INTO position_action_state (position_id, action, adx_4h, price, position_size, created_at) "
         "VALUES (?, 'open', ?, ?, ?, ?)",
-        (position_id, entry_adx, round(current_price, 1), round(position_btc, 6), now),
+        (position_id, entry_adx, round(current_price, 1), round(position_btc, 5), now),
     )
     conn.commit()
 
@@ -1174,24 +1260,19 @@ def manage_simulated_position(conn, data: dict, current_price: float):
             strong_strength = ("强", "中等")
 
         if holding_hours >= max_hours:
-            # Profit override: if position ever reached >= 5% leveraged profit,
-            # don't force-exit. Let trailing stop protect it.
-            # Use price extreme (min_price for short, max_price for long) to
-            # avoid penalizing momentary price fluctuations.
+            # Profit override: if current leveraged PnL >= 5%, don't force-exit.
+            # Let trailing stop protect profits. Using current price (not historical
+            # extremes) ensures stale + unprofitable positions are cleaned up even
+            # if they were profitable at some point in the past.
             entry = sim_pos.get("entry_price") or 0
             leverage = sim_pos.get("leverage") or 20
             side = sim_pos.get("side")
             if entry > 0:
-                # Calculate best-ever pnl from recorded price extremes
-                if side == "long":
-                    best_price = sim_pos.get("max_price") or current_price
-                    best_pnl = (best_price - entry) / entry * 100 * leverage
-                else:
-                    best_price = sim_pos.get("min_price") or current_price
-                    best_pnl = (entry - best_price) / entry * 100 * leverage
+                price_move = (current_price - entry) if side == "long" else (entry - current_price)
+                current_pnl = price_move / entry * 100 * leverage
 
-                if best_pnl >= 5:
-                    # Position was profitable at some point — let it run
+                if current_pnl >= 5:
+                    # Currently profitable — let it run, trailing stop will protect
                     pass
                 else:
                     confidence = verdict.get("confidence", 0)
@@ -1200,7 +1281,7 @@ def manage_simulated_position(conn, data: dict, current_price: float):
                     if weak_signal:
                         close_simulated_position(
                             conn, sim_pos, current_price,
-                            f"max_hold_time: {holding_hours:.1f}h, conf={confidence}, strength={strength}, best_pnl={best_pnl:.1f}%",
+                            f"max_hold_time: {holding_hours:.1f}h, pnl={current_pnl:.1f}%, conf={confidence}, strength={strength}",
                         )
                         return
 

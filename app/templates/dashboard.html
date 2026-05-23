@@ -1253,21 +1253,23 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
             <div style="margin-bottom:14px">
               <div class="weight-row">
                 <span class="weight-name" style="width:80px">趋势判断</span>
-                <div class="weight-bar-bg">
-                  <div class="weight-bar-fill" :style="{width: (tf.regime_accuracy||0)+'%', background: weightColor(tf.regime_accuracy)}"></div>
+                <div class="weight-bar-bg" v-if="tf.regime_accuracy !== null">
+                  <div class="weight-bar-fill" :style="{width: tf.regime_accuracy+'%', background: weightColor(tf.regime_accuracy)}"></div>
                 </div>
+                <div v-else style="flex:1;color:#4b5563;font-size:12px;text-align:center">—</div>
                 <span class="weight-acc" :class="tf.regime_accuracy!==null?(tf.regime_accuracy>=60?'up':tf.regime_accuracy<45?'down':''):''">
-                  {{ tf.regime_accuracy !== null ? tf.regime_accuracy + '%' : '-' }}
+                  {{ tf.regime_accuracy !== null ? tf.regime_accuracy + '%' : '—' }}
                 </span>
               </div>
               <div class="weight-row">
                 <span class="weight-name" style="width:80px">方向判断</span>
-                <div class="weight-bar-bg">
-                  <div class="weight-bar-fill" :style="{width: (tf.dir_accuracy||0)+'%', background: weightColor(tf.dir_accuracy)}"></div>
+                <div class="weight-bar-bg" v-if="tf.dir_accuracy !== null">
+                  <div class="weight-bar-fill" :style="{width: tf.dir_accuracy+'%', background: weightColor(tf.dir_accuracy)}"></div>
                 </div>
+                <div v-else style="flex:1;color:#4b5563;font-size:12px;text-align:center">—</div>
                 <span class="weight-acc" :class="tf.dir_accuracy!==null?(tf.dir_accuracy>=60?'up':tf.dir_accuracy<45?'down':''):''">
-                  {{ tf.dir_accuracy !== null ? tf.dir_accuracy + '%' : '-' }}
-                  <span style="color:#6b7280;font-size:10px" v-if="tf.dir_total">({{ tf.dir_correct }}/{{ tf.dir_total }})</span>
+                  {{ tf.dir_accuracy !== null ? tf.dir_accuracy + '%' : '—' }}
+                  <span style="color:#6b7280;font-size:10px" v-if="tf.dir_total && tf.dir_correct !== null">({{ tf.dir_correct }}/{{ tf.dir_total }})</span>
                 </span>
               </div>
             </div>
@@ -1457,10 +1459,6 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
             </div>
           </div>
           <div class="evo-stat">
-            <div class="evo-stat-label">杠杆倍数</div>
-            <div class="evo-stat-value">{{ hlPortfolio.leverage_ratio?.toFixed(1) || '0.0' }}x</div>
-          </div>
-          <div class="evo-stat">
             <div class="evo-stat-label">成交笔数</div>
             <div class="evo-stat-value">{{ hlPnlStats?.fill_count || 0 }}</div>
           </div>
@@ -1469,11 +1467,19 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
 
         <!-- PnL Curve Chart -->
         <div class="sim-equity" v-if="hlPnlCurve && hlPnlCurve.length >= 2">
-          <div class="sim-history-title">Perps PnL 曲线 (7天)</div>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+            <div class="sim-history-title" style="margin-bottom:0">Perps PnL 曲线</div>
+            <div style="display:flex;gap:4px">
+              <button @click="switchPnlDays(1)" :style="pnlBtnStyle(hlPnlDays.value === 1)">24H</button>
+              <button @click="switchPnlDays(7)" :style="pnlBtnStyle(hlPnlDays.value === 7)">7天</button>
+              <button @click="switchPnlDays(30)" :style="pnlBtnStyle(hlPnlDays.value === 30)">30天</button>
+              <button @click="switchPnlDays(0)" :style="pnlBtnStyle(hlPnlDays.value === 0)">全部</button>
+            </div>
+          </div>
           <div ref="pnlChartRef" style="height:220px"></div>
         </div>
         <div v-else-if="hlPnlStats" style="font-size:13px;color:#6b7280;padding:24px;text-align:center;background:#0d1220;border-radius:8px;border:1px solid #1f2937;margin-top:12px">
-          7天内无平仓记录
+          {{ hlPnlDays.value === 1 ? '24小时' : hlPnlDays.value === 7 ? '7天' : hlPnlDays.value === 30 ? '30天' : '全部' }}内无平仓记录
         </div>
 
         <!-- PnL Breakdown -->
@@ -1502,7 +1508,7 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
           <table class="recent-table">
             <thead>
               <tr>
-                <th>币种</th><th>方向</th><th>数量</th><th>开仓价</th><th>标记价</th><th>未实现PnL</th><th>ROE</th><th>杠杆</th><th>强平价</th>
+                <th>币种</th><th>方向</th><th>数量</th><th>开仓价</th><th>标记价</th><th>未实现PnL</th><th>ROE</th><th>强平价</th>
               </tr>
             </thead>
             <tbody>
@@ -1518,7 +1524,6 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
                 <td :style="{color: (p.roe_pct || 0) >= 0 ? '#22c55e' : '#ef4444'}">
                   {{ (p.roe_pct || 0) >= 0 ? '+' : '' }}{{ p.roe_pct?.toFixed(2) }}%
                 </td>
-                <td>{{ p.leverage }}x</td>
                 <td>${{ p.liquidation_price?.toFixed(1) }}</td>
               </tr>
             </tbody>
@@ -1528,7 +1533,7 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
 
         <!-- Open Orders -->
         <h3 style="margin-top:24px">挂单</h3>
-        <div v-if="hlOrders && hlOrders.length > 0" style="overflow-x:auto">
+        <div v-if="hlOpenOrders && hlOpenOrders.length > 0" style="overflow-x:auto">
           <table class="recent-table">
             <thead>
               <tr>
@@ -1536,7 +1541,7 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
               </tr>
             </thead>
             <tbody>
-              <tr v-for="o in hlOrders" :key="o.oid">
+              <tr v-for="o in hlOpenOrders" :key="o.oid">
                 <td style="font-size:10px;color:#9ca3af">{{ o.oid?.slice(0, 8) }}</td>
                 <td :style="{color: o.side === 'B' ? '#22c55e' : '#ef4444'}">{{ o.side === 'B' ? '买入' : '卖出' }}</td>
                 <td>{{ o.size?.toFixed(4) }}</td>
@@ -1550,36 +1555,85 @@ const SIM_INITIAL_BALANCE = {{ sim_initial_balance|default(10000) }};
         <div v-else style="font-size:13px;color:#6b7280;padding:12px;text-align:center;background:#0d1220;border-radius:8px;border:1px solid #1f2937">暂无挂单</div>
 
         <!-- Trade History (Fills) -->
-        <h3 style="margin-top:24px">成交历史</h3>
-        <div v-if="hlFills && hlFills.fills && hlFills.fills.length > 0" style="overflow-x:auto">
+        <h3 style="margin-top:24px">订单历史</h3>
+
+        <!-- Page size selector + Pagination -->
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <div style="display:flex;align-items:center;gap:8px;font-size:12px;color:#9ca3af">
+            每页
+            <select v-model.number="hlPageSize" @change="hlPage=1;loadOrderHistory()" style="background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:4px;padding:2px 6px;font-size:12px">
+              <option :value="10">10</option>
+              <option :value="20">20</option>
+              <option :value="50">50</option>
+            </select>
+            条
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button class="sim-page-btn" :disabled="hlOrderPage <= 1" @click="hlOrderPage--;loadOrderHistory()">上一页</button>
+            <span style="font-size:12px;color:#9ca3af">第 {{ hlOrderPage }} / {{ hlOrders.total_pages || 1 }} 页 (共 {{ hlOrders.total }} 单)</span>
+            <button class="sim-page-btn" :disabled="hlOrderPage >= hlOrders.total_pages" @click="hlOrderPage++;loadOrderHistory()">下一页</button>
+          </div>
+        </div>
+
+        <!-- Order List -->
+        <div v-if="hlOrders && hlOrders.orders && hlOrders.orders.length > 0" style="overflow-x:auto">
           <table class="recent-table">
             <thead>
               <tr>
-                <th>时间</th><th>方向</th><th>数量</th><th>价格</th><th>手续费</th><th>已实现PnL</th><th>操作</th>
+                <th>最后成交时间</th><th>方向</th><th>操作</th><th>成交笔数</th><th>总数量</th><th>均价</th><th>总PnL</th><th>手续费</th>
               </tr>
             </thead>
             <tbody>
-              <tr v-for="f in hlFills.fills" :key="f.oid + f.timestamp">
-                <td>{{ fmtTime(f.timestamp / 1000) }}</td>
-                <td :style="{color: f.side === 'long' ? '#22c55e' : '#ef4444'}">{{ f.side === 'long' ? '多' : '空' }}</td>
-                <td>{{ f.size?.toFixed(4) }}</td>
-                <td>${{ f.price?.toFixed(1) }}</td>
-                <td>${{ f.fee?.toFixed(2) }}</td>
-                <td :style="{color: (f.closed_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">
-                  {{ (f.closed_pnl || 0) >= 0 ? '+$' : '-$' }}{{ Math.abs(f.closed_pnl || 0).toFixed(2) }}
-                </td>
-                <td>{{ f.dir }}</td>
-              </tr>
+              <template v-for="o in hlOrders.orders" :key="o.oid">
+                <tr style="cursor:pointer" @click="toggleOrderFills(o.oid)">
+                  <td>{{ o.last_fill_date }}</td>
+                  <td :style="{color: o.side === 'long' ? '#22c55e' : '#ef4444'}">{{ o.side === 'long' ? '多' : '空' }}</td>
+                  <td style="font-size:11px;color:#6b7280">{{ o.dir }}</td>
+                  <td>{{ o.fill_count }}</td>
+                  <td>{{ o.total_size?.toFixed(4) }}</td>
+                  <td>${{ o.avg_price?.toFixed(1) }}</td>
+                  <td :style="{color: (o.total_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">
+                    {{ (o.total_pnl || 0) >= 0 ? '+$' : '-$' }}{{ Math.abs(o.total_pnl || 0).toFixed(2) }}
+                  </td>
+                  <td>${{ o.total_fee?.toFixed(2) }}</td>
+                </tr>
+                <!-- Expanded fills for this order -->
+                <tr v-if="expandedOrders.has(o.oid)" :key="o.oid + '_fills'">
+                  <td :colspan="8" style="padding:0">
+                    <div style="padding:8px 12px;background:#0d1220;font-size:11px">
+                      <div style="font-weight:600;color:#9ca3af;margin-bottom:6px">订单 #{{ o.oid }} 成交明细</div>
+                      <table style="width:100%;font-size:11px">
+                        <thead>
+                          <tr style="color:#6b7280">
+                            <th style="text-align:left;padding:4px 8px">时间</th>
+                            <th style="text-align:left;padding:4px 8px">方向</th>
+                            <th style="text-align:left;padding:4px 8px">数量</th>
+                            <th style="text-align:left;padding:4px 8px">价格</th>
+                            <th style="text-align:left;padding:4px 8px">手续费</th>
+                            <th style="text-align:left;padding:4px 8px">已实现PnL</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-for="f in getFillsByOrder(o.oid)" :key="f.tid">
+                            <td style="padding:4px 8px">{{ fmtTime(f.timestamp / 1000) }}</td>
+                            <td style="padding:4px 8px" :style="{color: f.side === 'long' ? '#22c55e' : '#ef4444'}">{{ f.side === 'long' ? '多' : '空' }}</td>
+                            <td style="padding:4px 8px">{{ f.size?.toFixed(4) }}</td>
+                            <td style="padding:4px 8px">${{ f.price?.toFixed(1) }}</td>
+                            <td style="padding:4px 8px">${{ f.fee?.toFixed(2) }}</td>
+                            <td style="padding:4px 8px" :style="{color: (f.closed_pnl || 0) >= 0 ? '#22c55e' : '#ef4444'}">
+                              {{ (f.closed_pnl || 0) >= 0 ? '+$' : '-$' }}{{ Math.abs(f.closed_pnl || 0).toFixed(2) }}
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </td>
+                </tr>
+              </template>
             </tbody>
           </table>
-          <!-- Pagination -->
-          <div style="display:flex;justify-content:center;gap:8px;margin-top:12px;align-items:center">
-            <button class="sim-page-btn" :disabled="hlFills.page <= 1" @click="hlPagePrev">上一页</button>
-            <span style="font-size:12px;color:#9ca3af">第 {{ hlFills.page }} / {{ hlFills.total_pages }} 页 (共 {{ hlFills.total }} 条)</span>
-            <button class="sim-page-btn" :disabled="hlFills.page >= hlFills.total_pages" @click="hlPageNext">下一页</button>
-          </div>
         </div>
-        <div v-else style="font-size:13px;color:#6b7280;padding:12px;text-align:center;background:#0d1220;border-radius:8px;border:1px solid #1f2937">暂无成交记录</div>
+        <div v-else style="font-size:13px;color:#6b7280;padding:12px;text-align:center;background:#0d1220;border-radius:8px;border:1px solid #1f2937">暂无订单记录</div>
 
         <!-- Fee Stats -->
         <h3 style="margin-top:24px">手续费统计</h3>
@@ -1639,14 +1693,43 @@ createApp({
     // ── Hyperliquid 实盘 ──
     const hlPortfolio = ref(null);
     const hlPositions = ref([]);
-    const hlOrders = ref([]);
+    const hlOpenOrders = ref([]);
+    const hlOrders = ref({ orders: [], total: 0, page: 1, total_pages: 1 });
     const hlFills = ref({ fills: [], total: 0, page: 1, total_pages: 1 });
     const hlFees = ref(null);
     const hlPnlStats = ref({ total_pnl: 0, fill_count: 0 });
     const hlPnlCurve = ref([]);
+    const hlPnlDays = ref(7);
     const pnlChartRef = ref(null);
     const hlPage = ref(1);
-    const hlPageSize = ref(50);
+    const hlOrderPage = ref(1);
+    const hlPageSize = ref(10);
+    const expandedOrders = ref(new Set());
+    const allHLFills = ref([]);  // cache all fills for order detail expansion
+
+    const switchPnlDays = (days) => {
+      hlPnlDays.value = days;
+      loadPnlCurve();
+    };
+
+    const pnlBtnStyle = (active) => {
+      const base = 'padding:4px 10px;border-radius:6px;border:1px solid #374151;background:transparent;color:#9ca3af;font-size:12px;cursor:pointer;transition:all .15s';
+      return active ? `${base};background:#3b82f6;color:#fff;border-color:#3b82f6` : base;
+    };
+
+    const loadPnlCurve = async () => {
+      try {
+        const daysParam = hlPnlDays.value > 0 ? `?days=${hlPnlDays.value}` : '';
+        const resp = await fetch(`./api/hyperliquid/pnl_curve${daysParam}`);
+        if (resp.ok) {
+          const pnlData = await resp.json();
+          hlPnlCurve.value = pnlData.curve;
+          Vue.nextTick(() => {
+            setTimeout(() => renderPnlChart(), 150);
+          });
+        }
+      } catch(e) { console.error('loadPnlCurve error:', e); }
+    };
 
     const loadHLData = async () => {
       try {
@@ -1656,11 +1739,11 @@ createApp({
           fetch('./api/hyperliquid/orders'),
           fetch(`./api/hyperliquid/fills?page=${hlPage.value}&size=${hlPageSize.value}`),
           fetch('./api/hyperliquid/fees'),
-          fetch('./api/hyperliquid/pnl_curve?days=7'),
+          fetch(`./api/hyperliquid/pnl_curve?days=${hlPnlDays.value}`),
         ]);
         if (pResp.ok) hlPortfolio.value = await pResp.json();
         if (posResp.ok) hlPositions.value = await posResp.json();
-        if (oResp.ok) hlOrders.value = await oResp.json();
+        if (oResp.ok) hlOpenOrders.value = await oResp.json();
         if (fResp.ok) hlFills.value = await fResp.json();
         if (feeResp.ok) hlFees.value = await feeResp.json();
         if (pnlResp.ok) {
@@ -1671,11 +1754,42 @@ createApp({
             setTimeout(() => renderPnlChart(), 150);
           });
         }
+        await loadOrderHistory();
       } catch(e) { console.error('HL data load error:', e); }
     };
 
     const hlPagePrev = () => { if (hlPage.value > 1) { hlPage.value--; loadHLData(); } };
     const hlPageNext = () => { if (hlPage.value < hlFills.value.total_pages) { hlPage.value++; loadHLData(); } };
+
+    const toggleOrderFills = (oid) => {
+      const s = expandedOrders.value;
+      if (s.has(oid)) {
+        s.delete(oid);
+      } else {
+        s.add(oid);
+      }
+      // Force reactivity update
+      expandedOrders.value = new Set(s);
+    };
+
+    const getFillsByOrder = (oid) => {
+      // Use allHLFills (full cache) instead of paginated hlFills
+      return (allHLFills.value || []).filter(f => f.oid === oid);
+    };
+
+    const loadOrderHistory = async () => {
+      try {
+        const [oResp, fResp] = await Promise.all([
+          fetch(`./api/hyperliquid/order_history?page=${hlOrderPage.value}&size=${hlPageSize.value}`),
+          fetch('./api/hyperliquid/fills?page=1&size=10000'),
+        ]);
+        if (oResp.ok) hlOrders.value = await oResp.json();
+        if (fResp.ok) {
+          const fd = await fResp.json();
+          allHLFills.value = fd.fills || [];
+        }
+      } catch(e) { console.error('loadOrderHistory error:', e); }
+    };
 
     // ── 模拟仓位加载 ──
     const loadSimPosition = async () => {
@@ -1796,12 +1910,17 @@ createApp({
         container.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#4b5563;font-size:13px">数据不足</div>`;
         return;
       }
+      // Downsample: max 80 visible points to avoid SVG rendering issues
+      const maxPts = 80;
+      const sampled = pts.length > maxPts
+        ? pts.filter((_, i) => i % Math.ceil(pts.length / maxPts) === 0 || i === pts.length - 1)
+        : pts;
       const w = container.clientWidth || container.getBoundingClientRect().width || 600;
       const h = 220;
       const pad = { t: 20, r: 20, b: 30, l: 55 };
       const chartW = w - pad.l - pad.r;
       const chartH = h - pad.t - pad.b;
-      const vals = pts.map(p => p.cum_pnl);
+      const vals = sampled.map(p => p.cum_pnl);
       const minV = Math.min(...vals);
       const maxV = Math.max(...vals);
       const range = maxV - minV || 1;
@@ -1810,13 +1929,13 @@ createApp({
       const yRange = yMax - yMin;
       const isPositive = vals[vals.length - 1] >= 0;
 
-      const scaleX = (i) => pad.l + (i / (pts.length - 1)) * chartW;
+      const scaleX = (i) => pad.l + (i / (sampled.length - 1)) * chartW;
       const scaleY = (v) => pad.t + chartH - ((v - yMin) / yRange) * chartH;
 
-      let linePath = pts.map((p, i) => `${i === 0 ? 'M' : 'L'} ${scaleX(i).toFixed(1)} ${scaleY(p.cum_pnl).toFixed(1)}`).join(' ');
+      let linePath = sampled.map((p, i) => `${i === 0 ? 'M' : 'L'} ${scaleX(i).toFixed(1)} ${scaleY(p.cum_pnl).toFixed(1)}`).join(' ');
       const fillColor = isPositive ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)';
       const lineColor = isPositive ? '#22c55e' : '#ef4444';
-      const areaPath = linePath + ` L ${scaleX(pts.length - 1).toFixed(1)} ${(pad.t + chartH).toFixed(1)} L ${scaleX(0).toFixed(1)} ${(pad.t + chartH).toFixed(1)} Z`;
+      const areaPath = linePath + ` L ${scaleX(sampled.length - 1).toFixed(1)} ${(pad.t + chartH).toFixed(1)} L ${scaleX(0).toFixed(1)} ${(pad.t + chartH).toFixed(1)} Z`;
 
       let gridLines = '';
       for (let i = 0; i < 5; i++) {
@@ -1827,14 +1946,14 @@ createApp({
       }
 
       let xLabels = '';
-      const step = Math.max(1, Math.floor(pts.length / 7));
-      pts.forEach((p, i) => {
-        if (i % step === 0 || i === pts.length - 1) {
+      const labelStep = Math.max(1, Math.floor(sampled.length / 7));
+      sampled.forEach((p, i) => {
+        if (i % labelStep === 0 || i === sampled.length - 1) {
           xLabels += `<text x="${scaleX(i).toFixed(1)}" y="${h - 5}" text-anchor="middle" fill="#6b7280" font-size="9">${p.date}</text>`;
         }
       });
 
-      let dots = pts.map((p, i) => `<circle cx="${scaleX(i).toFixed(1)}" cy="${scaleY(p.cum_pnl).toFixed(1)}" r="2.5" fill="${lineColor}" stroke="#111827" stroke-width="1"/>`).join('');
+      let dots = sampled.map((p, i) => `<circle cx="${scaleX(i).toFixed(1)}" cy="${scaleY(p.cum_pnl).toFixed(1)}" r="2.5" fill="${lineColor}" stroke="#111827" stroke-width="1"/>`).join('');
 
       const zeroY = scaleY(0);
       const zeroLine = (minV < 0 && maxV > 0) ? `<line x1="${pad.l}" y1="${zeroY}" x2="${w - pad.r}" y2="${zeroY}" stroke="#fbbf24" stroke-width="1" stroke-dasharray="4,4"/>` : '';
@@ -1908,7 +2027,7 @@ createApp({
       const p = simPosition.value;
       const size = parseFloat(p.position_size);
       if (isNaN(size) || size === 0) return '-';
-      return size.toFixed(4);
+      return size.toFixed(5);
     });
 
     const simNotionalValue = computed(() => {
@@ -2453,7 +2572,7 @@ createApp({
              verdictRegimeText, tfRegimeText, hRegimeText, hRegimeClass,
              dedupedHistory,
              simPosition, simHistory, simPage, simPageSize, simTotalPages, simTotal, simPagePrev, simPageNext, simPageTo, simStats, simPositionSize, simNotionalValue, simPnl, simHoldTime, simActionStateText, simCloseReasonText, histActionLabel, histActionColor, histPrice, histPositionSize, histMargin, histDetail, histStatus, simHistSize, simHistMargin, simStopDist, simStopDistColor, equityChartRef,
-             hlPortfolio, hlPositions, hlOrders, hlFills, hlFees, hlPnlStats, hlPnlCurve, pnlChartRef, hlPagePrev, hlPageNext,
+             hlPortfolio, hlPositions, hlOpenOrders, hlOrders, hlFills, allHLFills, hlFees, hlPnlStats, hlPnlCurve, hlPnlDays, switchPnlDays, pnlBtnStyle, pnlChartRef, hlPagePrev, hlPageNext, hlOrderPage, hlPageSize, loadOrderHistory, toggleOrderFills, getFillsByOrder, expandedOrders,
              marketContextFundingRateText, marketContextFundingRateColor, marketContextOIText, marketContextCircuitBreakerWarning, marketContextConvergenceWarning, marketContextConvergenceDirection, marketContextConvergenceReason, marketContextRangingBreakout, marketContextRangingBreakoutDirection, marketContextRangingBreakoutReason, stage1Warning, stage1WarningTypeLabel, stage1WarningDirection, stage1WarningReason, stage1WarningPositionHint, stage1WarningConfidence, marketContextLeverageText, marketContextRiskText, marketContextVolAdjText, marketContextVolAdjColor, volAdjColor, tfVolPercent, tfBase, tfEff };
   }
 }).mount('#app');

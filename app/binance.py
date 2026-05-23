@@ -40,6 +40,7 @@ def _get_exchange() -> ccxt.binance:
             if _exchange is None:
                 _exchange = ccxt.binance({
                     "enableRateLimit": True,
+                    "timeout": 20000,  # 20s — exchangeInfo can take 10s+ from CN
                     "options": {"defaultType": "swap"},
                 })
     return _exchange

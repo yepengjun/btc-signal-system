@@ -15,6 +15,69 @@ from app.config import settings
 _logger = logging.getLogger(__name__)
 
 
+def sync_fills_to_db(conn, viewer: "HyperliquidViewer", coin: str = "BTC", limit: int = 500):
+    """Incrementally sync Hyperliquid fills into local hl_fills table.
+
+    Fetches recent fills from HL API, inserts only those with tid > local max.
+    First run does a full backfill (up to limit records).
+    """
+    import sqlite3
+
+    try:
+        row = conn.execute("SELECT MAX(tid) FROM hl_fills").fetchone()
+        local_max_tid = row[0] if row and row[0] is not None else None
+
+        # Fetch recent fills from HL API
+        all_fills = viewer._info.user_fills(viewer._account_address)
+        all_fills = [f for f in all_fills if f.get("coin") == coin]
+
+        # Filter to only new fills
+        new_fills = []
+        for f in all_fills:
+            tid = str(f.get("tid", ""))
+            if local_max_tid is None or float(tid) > float(local_max_tid):
+                new_fills.append(f)
+
+        if not new_fills:
+            return 0  # nothing new
+
+        now = time.time()
+        inserted = 0
+        for f in new_fills:
+            try:
+                conn.execute(
+                    """INSERT INTO hl_fills
+                       (tid, oid, coin, side, size, price, fee, closed_pnl,
+                        dir, start_position, position, timestamp_ms, synced_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(f.get("tid", "")),
+                        str(f.get("oid", "")),
+                        f.get("coin", ""),
+                        "long" if f.get("side", "") == "B" else "short",
+                        float(f.get("sz", 0)),
+                        float(f.get("px", 0)),
+                        float(f.get("fee", 0)),
+                        float(f.get("closedPnl", 0)),
+                        f.get("dir", ""),
+                        float(f.get("startPosition", 0)),
+                        float(f.get("position", 0)),
+                        float(f.get("time", 0)),
+                        now,
+                    ),
+                )
+                inserted += 1
+            except sqlite3.IntegrityError:
+                pass  # duplicate tid, skip
+
+        conn.commit()
+        _logger.info("[HL fills] synced %d new fills (total in DB: %d)", inserted, len(all_fills))
+        return inserted
+    except Exception:
+        _logger.exception("sync_fills_to_db failed")
+        return 0
+
+
 class HyperliquidViewer:
     """Read-only viewer for Hyperliquid portfolio data."""
 
@@ -152,6 +215,7 @@ class HyperliquidViewer:
                     "closed_pnl": float(f.get("closedPnl", 0)),
                     "dir": f.get("dir", ""),
                     "oid": str(f.get("oid", "")),
+                    "tid": str(f.get("tid", "")),
                     "start_position": float(f.get("startPosition", 0)),
                     "position": float(f.get("position", 0)),
                 })

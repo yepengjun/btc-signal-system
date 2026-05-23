@@ -1,6 +1,7 @@
 import sqlite3
 import hashlib
 import os
+import time
 
 from app.config import settings
 
@@ -197,6 +198,7 @@ def init_db():
         "ALTER TABLE positions ADD COLUMN position_size REAL",
         "ALTER TABLE positions ADD COLUMN realized_pnl REAL DEFAULT 0",
         "ALTER TABLE positions ADD COLUMN last_decay_tightened REAL",
+        "ALTER TABLE positions ADD COLUMN decay_tighten_count INTEGER DEFAULT 0",
     ]:
         try:
             c.execute(col_sql)
@@ -256,6 +258,49 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # HL fills cache table: incremental sync of Hyperliquid trade fills
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS hl_fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tid TEXT NOT NULL UNIQUE,
+            oid TEXT NOT NULL,
+            coin TEXT NOT NULL,
+            side TEXT NOT NULL,
+            size REAL NOT NULL,
+            price REAL NOT NULL,
+            fee REAL NOT NULL,
+            closed_pnl REAL DEFAULT 0,
+            dir TEXT,
+            start_position REAL,
+            position REAL,
+            timestamp_ms REAL NOT NULL,
+            synced_at REAL
+        )
+    """)
+    try:
+        c.execute("CREATE INDEX IF NOT EXISTS idx_hl_fills_tid ON hl_fills(tid)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_hl_fills_ts ON hl_fills(timestamp_ms DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_hl_fills_coin ON hl_fills(coin)")
+    except sqlite3.OperationalError:
+        pass
+
+    # HL order mapping table: tracks all Hyperliquid orders per position
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS hl_order_mapping (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_id INTEGER NOT NULL,
+            oid TEXT NOT NULL,
+            action TEXT NOT NULL,
+            size REAL,
+            price REAL,
+            created_at REAL
+        )
+    """)
+    try:
+        c.execute("CREATE INDEX IF NOT EXISTS idx_hl_order_mapping_position ON hl_order_mapping(position_id)")
+    except sqlite3.OperationalError:
+        pass
+
     # K-line persistent cache table
     c.execute("""
         CREATE TABLE IF NOT EXISTS klines (
@@ -301,5 +346,43 @@ def init_db():
         (pw_hash, old_default_hash),
     )
 
+    conn.commit()
+    conn.close()
+
+
+def record_hl_order(position_id: int, oid: str, action: str,
+                    size: float = None, price: float = None, created_at: float = None):
+    """Record a Hyperliquid order execution in hl_order_mapping table.
+
+    Call this after every HL order (open/close/add/reduce/tp/sl) to maintain
+    the position → HL orders chain for audit and debugging.
+    """
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO hl_order_mapping (position_id, oid, action, size, price, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (position_id, str(oid), action, size, price, created_at or time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_hl_order_price(oid: str, new_price: float, new_size: float = None):
+    """Update price (and optionally size) of an existing HL order mapping.
+
+    Used when set_take_profit/set_stop_loss succeeds via modify_order (oid unchanged)
+    — records the price change without inserting a duplicate row.
+    """
+    conn = get_connection()
+    if new_size is not None:
+        conn.execute(
+            "UPDATE hl_order_mapping SET price=?, size=? WHERE oid=?",
+            (new_price, new_size, str(oid)),
+        )
+    else:
+        conn.execute(
+            "UPDATE hl_order_mapping SET price=? WHERE oid=?",
+            (new_price, str(oid)),
+        )
     conn.commit()
     conn.close()

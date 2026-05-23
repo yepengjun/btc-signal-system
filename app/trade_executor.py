@@ -63,8 +63,21 @@ class TradeExecutor(ABC):
         """List all open orders."""
 
     @abstractmethod
-    def get_position_state(self) -> dict:
-        """Get actual position state from exchange (for sync)."""
+    def get_position_state(self) -> tuple[dict | None, str | None]:
+        """Get actual position state from exchange (for sync).
+
+        Returns:
+            (state, None) on success — state is {} if no position
+            (None, error_msg) on failure
+        """
+
+    @abstractmethod
+    def get_account_value(self) -> Optional[float]:
+        """Get account value (total equity) from exchange, or None if not available."""
+
+    @abstractmethod
+    def get_realized_pnl(self) -> float:
+        """Get cumulative realized PnL from closed positions. Returns 0 if not available."""
 
 
 class HyperliquidExecutor(TradeExecutor):
@@ -129,19 +142,23 @@ class HyperliquidExecutor(TradeExecutor):
             is_buy = side == "long"
 
             # Step 1: Market entry
-            result = ex.market_open(name="BTC", is_buy=is_buy, sz=round(size, 6), px=None, slippage=0.01)
+            # BTC szDecimals=5 on testnet, so round to 5 decimal places
+            result = ex.market_open(name="BTC", is_buy=is_buy, sz=round(size, 5), px=None, slippage=0.01)
 
             if result.get("status") != "ok":
                 return {"ok": False, "error": str(result)}
 
             entry_oid = self._extract_oid(result)
+            if not entry_oid:
+                _logger.warning("HL open: market_open succeeded but order_id not extracted — treating as failure")
+                return {"ok": False, "error": "market_open succeeded but order_id not extracted"}
             _logger.info("HL OPEN (market): side=%s size=%s leverage=%s entry_oid=%s",
                          side, size, leverage, entry_oid)
 
             # Step 2: Set stop-loss
             sl_oid = None
             if sl:
-                sl_result = self.set_stop_loss("", sl, round(size, 6), side)
+                sl_result = self.set_stop_loss("", sl, round(size, 5), side)
                 if sl_result["ok"]:
                     sl_oid = sl_result["order_id"]
                     _logger.info("HL SL set: oid=%s price=%s", sl_oid, sl)
@@ -152,7 +169,7 @@ class HyperliquidExecutor(TradeExecutor):
             # Step 3: Set take-profit
             tp_oid = None
             if tp:
-                tp_result = self.set_take_profit("", tp, round(size, 6), side)
+                tp_result = self.set_take_profit("", tp, round(size, 5), side)
                 if tp_result["ok"]:
                     tp_oid = tp_result["order_id"]
                     _logger.info("HL TP set: oid=%s price=%s", tp_oid, tp)
@@ -170,15 +187,18 @@ class HyperliquidExecutor(TradeExecutor):
         """Close position. size=0 means full close."""
         try:
             ex = self._exchange
-            pos = self.get_position_state()
-            sz = size if size and size > 0 else pos.get("size")
+            pos, err = self.get_position_state()
+            sz = size if size and size > 0 else (pos or {}).get("size")
             if not sz:
                 return {"ok": False, "error": "No position to close"}
-            is_buy = pos.get("side") == "short"
+            is_buy = (pos or {}).get("side") == "short"
             price = ex._slippage_price("BTC", is_buy, 0.01, None)
             result = ex.market_close(coin="BTC", sz=sz, px=price, slippage=0.01)
             if result and result.get("status") == "ok":
                 oid = self._extract_oid(result)
+                if not oid:
+                    _logger.warning("HL close: market_close succeeded but order_id not extracted — treating as failure")
+                    return {"ok": False, "error": "close succeeded but order_id not extracted"}
                 fill_px = self._extract_fill_price(result, price)
                 _logger.info("HL CLOSE: size=%s oid=%s fill_price=%s", sz, oid, fill_px)
                 return {"ok": True, "order_id": oid, "size": sz, "fill_price": fill_px}
@@ -192,7 +212,7 @@ class HyperliquidExecutor(TradeExecutor):
         """Reduce = partial close with explicit size."""
         try:
             ex = self._exchange
-            pos = self.get_position_state()
+            pos, err = self.get_position_state()
             if not pos or not pos.get("size"):
                 return {"ok": False, "error": "No position to reduce"}
             is_buy = pos.get("side") == "short"
@@ -316,6 +336,7 @@ class HyperliquidExecutor(TradeExecutor):
                 # modify_order doesn't support trigger orders directly,
                 # cancel old and place new
                 cancel_ok = False
+                old_oid = oid
                 try:
                     cancel_result = self.cancel_order(str(oid))
                     cancel_ok = cancel_result.get("ok", False)
@@ -345,6 +366,12 @@ class HyperliquidExecutor(TradeExecutor):
                     order_type=order_type,
                     reduce_only=True
                 )
+
+                # If cancel succeeded but new order failed, the position has
+                # NO SL protection. Log urgently so reconcile loop picks it up.
+                if not result.get("status") == "ok" and cancel_ok:
+                    _logger.error("HL SL: cancel succeeded but new order FAILED (old_oid=%s, new_price=%s) — "
+                                  "position has NO stop-loss until reconcile recreates it", old_oid, price)
             else:
                 result = ex.order(
                     name="BTC", is_buy=is_buy, sz=size,
@@ -387,7 +414,27 @@ class HyperliquidExecutor(TradeExecutor):
             _logger.exception("HL get_open_orders failed")
             return []
 
-    def get_position_state(self) -> dict:
+    def get_account_value(self) -> Optional[float]:
+        """Get HL account value (total equity: available + margin used)."""
+        try:
+            state = self._info.user_state(self.account_address)
+            ms = state.get("marginSummary", {})
+            return float(ms.get("accountValue", 0))
+        except Exception:
+            _logger.exception("HL get_account_value failed")
+            return None
+
+    def get_realized_pnl(self) -> float:
+        """Get cumulative realized PnL from all BTC fills on Hyperliquid."""
+        try:
+            fills = self._info.user_fills(self.account_address)
+            btc_fills = [f for f in fills if f.get("coin") == "BTC"]
+            return sum(float(f.get("closedPnl", 0)) for f in btc_fills)
+        except Exception:
+            _logger.exception("HL get_realized_pnl failed")
+            return 0.0
+
+    def get_position_state(self) -> tuple[dict | None, str | None]:
         """Get actual BTC perp position from Hyperliquid."""
         try:
             state = self._info.user_state(self.account_address)
@@ -401,18 +448,30 @@ class HyperliquidExecutor(TradeExecutor):
                         "entry_price": float(pos.get("entryPx", 0)),
                         "unrealized_pnl": float(pos.get("unrealizedPnl", 0)),
                         "leverage": float(pos.get("leverage", {}).get("value", 20)),
-                    }
-            return {}  # no position
+                    }, None
+            return {}, None  # no position
         except Exception as e:
             _logger.exception("HL get_position_state failed")
-            return {}
+            return None, str(e)
 
     def _extract_oid(self, result: dict) -> Optional[str]:
-        for status in result.get("response", {}).get("data", {}).get("statuses", []):
+        import json as _json
+        resp = result.get("response")
+        # Handle case where response is a JSON string
+        if isinstance(resp, str):
+            try:
+                resp = _json.loads(resp)
+            except Exception:
+                _logger.warning("_extract_oid: failed to parse response as JSON: %s", resp[:200])
+                return None
+        data = (resp or {}).get("data", {})
+        statuses = data.get("statuses", [])
+        for status in statuses:
             if "filled" in status:
                 return str(status["filled"].get("oid"))
             if "resting" in status:
                 return str(status["resting"].get("oid"))
+        _logger.warning("_extract_oid: no oid found in statuses=%s", statuses)
         return None
 
     def _extract_fill_price(self, result: dict, fallback: float) -> Optional[float]:
@@ -484,8 +543,14 @@ class SimulatedExecutor(TradeExecutor):
     def get_open_orders(self) -> list:
         return []
 
-    def get_position_state(self) -> dict:
-        return {}
+    def get_position_state(self) -> tuple[dict | None, str | None]:
+        return {}, None
+
+    def get_account_value(self) -> Optional[float]:
+        return None
+
+    def get_realized_pnl(self) -> float:
+        return 0.0
 
 
 class TradeRouter:
@@ -528,8 +593,14 @@ class TradeRouter:
     def get_open_orders(self) -> list:
         return self._executor.get_open_orders()
 
-    def get_position_state(self) -> dict:
+    def get_position_state(self) -> tuple[dict | None, str | None]:
         return self._executor.get_position_state()
+
+    def get_account_value(self) -> Optional[float]:
+        return self._executor.get_account_value()
+
+    def get_realized_pnl(self) -> float:
+        return self._executor.get_realized_pnl()
 
 
 # Singleton

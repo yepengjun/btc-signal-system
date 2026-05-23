@@ -727,7 +727,7 @@ def _compute_evolution_adjustments(stats: dict) -> dict:
                 # Already at floor: only mark unreliable if overall accuracy is also poor.
                 # Short-term streaks during a specific regime (e.g. chop) shouldn't
                 # permanently disable a timeframe with decent overall accuracy.
-                if regime_acc < 60:
+                if regime_acc is not None and regime_acc < 60:
                     tf_cfg["unreliable"] = True
                 else:
                     tf_cfg["unreliable"] = False  # recover: overall accuracy healthy
@@ -742,7 +742,7 @@ def _compute_evolution_adjustments(stats: dict) -> dict:
             continue
 
         # Clear consecutive counter if regime accuracy is healthy
-        if regime_acc >= 60:
+        if regime_acc is not None and regime_acc >= 60:
             tf_cfg["consecutive_wrong_regime"] = 0
             tf_cfg["unreliable"] = False
 
@@ -1003,26 +1003,30 @@ def get_evolution_stats() -> dict:
             regime_accuracy_decay = 50.0
             dir_accuracy_decay = 50.0
 
+        # When verified == 0, return None for all accuracy metrics so the
+        # frontend shows "数据积累中" instead of misleading 0%.
+        _denom = verified if verified > 0 else None
+
         timeframes[tf] = {
             "total": total,
             "verified": verified,
             "pending": pending,
             "unverifiable": unverifiable,
             "regime_correct": regime_correct,
-            "regime_accuracy": round(regime_correct / max(verified, 1) * 100, 1),
-            "regime_accuracy_decay": regime_accuracy_decay,
+            "regime_accuracy": round(regime_correct / _denom * 100, 1) if _denom else None,
+            "regime_accuracy_decay": regime_accuracy_decay if verified > 0 else None,
             "dir_total": dir_total,
             "dir_correct": dir_correct,
-            "dir_accuracy": round(dir_correct / max(dir_total, 1) * 100, 1),
-            "dir_accuracy_decay": dir_accuracy_decay,
+            "dir_accuracy": round(dir_correct / max(dir_total, 1) * 100, 1) if dir_total > 0 else None,
+            "dir_accuracy_decay": dir_accuracy_decay if verified > 0 else None,
             "regime_correct_loose": regime_correct_loose_count,
-            "regime_accuracy_loose": round(regime_correct_loose_count / max(verified, 1) * 100, 1),
+            "regime_accuracy_loose": round(regime_correct_loose_count / _denom * 100, 1) if _denom else None,
             "move_sufficient": move_sufficient_count,
-            "move_sufficient_pct": round(move_sufficient_count / max(verified, 1) * 100, 1),
+            "move_sufficient_pct": round(move_sufficient_count / _denom * 100, 1) if _denom else None,
             "structure_aligned": structure_aligned_count,
-            "structure_aligned_pct": round(structure_aligned_count / max(verified, 1) * 100, 1),
+            "structure_aligned_pct": round(structure_aligned_count / _denom * 100, 1) if _denom else None,
             "longer_term_valid": longer_term_valid_count,
-            "longer_term_valid_pct": round(longer_term_valid_count / max(verified, 1) * 100, 1),
+            "longer_term_valid_pct": round(longer_term_valid_count / _denom * 100, 1) if _denom else None,
             "regime_counts": regime_counts,
             "adx_accuracy": adx_accuracy,
             "mfe_mae_stats": {
